@@ -1,0 +1,96 @@
+{
+  "format": "keto-layouts/2",
+  "description": "Hardware-defined NVIDIA channel structures (instance block / RAMIN, RAMFC, USERD, runlist entries) per generation. Byte offsets from the start of the structure. Bit-field specs are [byte_offset, hi_bit, lo_bit]. Source table: docs/research/NVIDIA_HW_FACTS.md section 2.10 (instance block offsets per generation), 2.11 (USERD), topic 3 (runlists).",
+  "layouts": {
+    "kepler": {
+      "provenance": [
+        "NVIDIA nvgpu GK20A hw_ram_gk20a.h (Kepler) [NVIDIA-published] + nouveau gk104 channel code: RAMFC USERD 0x08/0x0C, SIGNATURE 0x10 (0xFACE), GP_GET 0x14, GP_BASE 0x48/0x4C (LIMIT2 20:16), HCE_CTRL 0xE4 (priv bit 5), CHID 0xE8 11:0; RAMIN page directory 0x200/0x204",
+        "Kepler runlists hold 8-byte entries with channel ids only (no instance pointer): they cannot be tied to instance blocks from memory alone"
+      ],
+      "ramin": {"size": "0x1000", "page_dir_base_lo": "0x200", "page_dir_base_hi": "0x204", "sc_count": 0},
+      "ramfc": {
+        "size": "0x200", "gp_put": "0x00", "userd_lo": "0x08", "userd_hi": "0x0c", "signature": "0x10", "gp_get": "0x14",
+        "pb_get": "0x18", "pb_get_hi": "0x1c", "gp_base_lo": "0x48", "gp_base_hi": "0x4c", "pb_put": "0x5c",
+        "pb_put_hi": "0x60", "hce_ctrl": "0xe4", "chid": ["0xe8", 11, 0], "gp_limit2": ["0x4c", 20, 16],
+        "gp_base_hi_bits": 8, "signature_mask": "0xffff", "signature_value": "0xface", "hce_priv_bit": 5
+      },
+      "userd": {"size": "0x200", "put": "0x40", "get": "0x44", "ref": "0x48", "put_hi": "0x4c", "get_hi": "0x60",
+                "gp_get": "0x88", "gp_put": "0x8c"},
+      "runlist": {"format": "gk104", "entry_size": 8, "subcontexts": false}
+    },
+    "maxwell_pascal": {
+      "provenance": [
+        "NVIDIA published maxwell/gm107 dev_ram.h and nvgpu GM20B/GP10B headers [NVIDIA-published]: RAMFC/RAMIN offsets identical to Kepler",
+        "Runlist: 8-byte entries; nouveau writes the instance block address >> 12 in word1 from GM107 on and the runqueue at bit 14 on Pascal [nouveau]",
+        "Pascal selects VER1 or VER2 page tables per instance block with NV_RAMIN_USE_VER2_PT_FORMAT (bit 10 of word 128)"
+      ],
+      "ramin": {"size": "0x1000", "page_dir_base_lo": "0x200", "page_dir_base_hi": "0x204", "sc_count": 0},
+      "ramfc": {
+        "size": "0x200", "gp_put": "0x00", "userd_lo": "0x08", "userd_hi": "0x0c", "signature": "0x10", "gp_get": "0x14",
+        "pb_get": "0x18", "pb_get_hi": "0x1c", "gp_base_lo": "0x48", "gp_base_hi": "0x4c", "pb_put": "0x5c",
+        "pb_put_hi": "0x60", "hce_ctrl": "0xe4", "chid": ["0xe8", 11, 0], "gp_limit2": ["0x4c", 20, 16],
+        "gp_base_hi_bits": 8, "signature_mask": "0xffff", "signature_value": "0xface", "hce_priv_bit": 5
+      },
+      "userd": {"size": "0x200", "put": "0x40", "get": "0x44", "ref": "0x48", "put_hi": "0x4c", "get_hi": "0x60",
+                "gp_get": "0x88", "gp_put": "0x8c"},
+      "runlist": {"format": "gm107", "entry_size": 8, "subcontexts": false}
+    },
+    "volta": {
+      "provenance": [
+        "NVIDIA open-gpu-doc manuals/volta/gv100/dev_ram.ref.txt (NV_RAMIN_*, NV_RAMFC_*, NV_RAMUSERD_*, NV_RAMRL_ENTRY_*) [NVIDIA-published]",
+        "CHID at RAMFC 0xE8 per nvgpu GV11B ram_fc_chid_w() and nouveau; HCE privilege bit 5 (NV_PPBDMA_HCE_CTRL_HCE_PRIV_MODE 5:5)"
+      ],
+      "ramin": {"size": "0x1000", "page_dir_base_lo": "0x200", "page_dir_base_hi": "0x204", "engine_wfi_lo": "0x210",
+                "engine_wfi_hi": "0x214", "engine_wfi_veid": "0x218", "pasid": "0x21c", "eng_method_buffer_lo": "0x220",
+                "eng_method_buffer_hi": "0x224", "sc_pdb_valid": "0x298", "sc_page_dir_base": "0x2a0", "sc_stride": "0x10",
+                "sc_count": 64},
+      "ramfc": {
+        "size": "0x200", "gp_put": "0x00", "mem_op_a": "0x04", "userd_lo": "0x08", "userd_hi": "0x0c", "signature": "0x10",
+        "gp_get": "0x14", "pb_get": "0x18", "pb_get_hi": "0x1c", "ref": "0x28", "sem_addr_hi": "0x38", "sem_addr_lo": "0x3c",
+        "sem_payload_lo": "0x40", "sem_execute": "0x44", "gp_base_lo": "0x48", "gp_base_hi": "0x4c", "pb_put": "0x5c",
+        "pb_put_hi": "0x60", "pb_header": "0x84", "subdevice": "0x94", "target": "0xac", "hce_ctrl": "0xe4",
+        "config": "0xf4", "set_channel_info": "0xfc", "chid": ["0xe8", 11, 0], "gp_limit2": ["0x4c", 20, 16],
+        "gp_base_hi_bits": 8, "signature_mask": "0xffff", "signature_value": "0xface", "hce_priv_bit": 5
+      },
+      "userd": {"size": "0x200", "put": "0x40", "get": "0x44", "ref": "0x48", "put_hi": "0x4c", "top_level_get": "0x58",
+                "top_level_get_hi": "0x5c", "get_hi": "0x60", "gp_get": "0x88", "gp_put": "0x8c"},
+      "runlist": {"format": "gv100", "entry_size": 16, "subcontexts": true}
+    },
+    "turing": {
+      "provenance": [
+        "As Volta; CHID is in SET_CHANNEL_INFO (RAMFC 0xFC) bits 27:16 as written by NVIDIA RM (open-gpu-kernel-modules) [NVIDIA-published RM code]"
+      ],
+      "inherit": "volta",
+      "ramfc": {"chid": ["0xfc", 27, 16]}
+    },
+    "ampere": {
+      "provenance": [
+        "NVIDIA open-gpu-doc manuals/ampere/ga100/dev_ram.ref.txt [NVIDIA-published]: RAMFC words 2/3 (USERD) are reserved from Ampere on - USERD is located only through the runlist entry (CHAN_USERD_PTR)",
+        "CHID in SET_CHANNEL_INFO (0xFC) bits 27:16 (RM); GA10B instance blocks carry 0xcafeca11 at RAMIN 0x20C (RM-written)"
+      ],
+      "inherit": "turing",
+      "drop": {"ramfc": ["userd_lo", "userd_hi"]}
+    },
+    "hopper": {
+      "provenance": [
+        "NVIDIA published hopper/gh100 dev_ram.h delta [NVIDIA-published]: LIMIT2 moved to RAMFC 0xA4 bits 4:0, GP_BASE_HI widened to 24:0 (57-bit VA)"
+      ],
+      "inherit": "ampere",
+      "ramfc": {"gp_limit2": ["0xa4", 4, 0], "gp_base_hi_bits": 25}
+    },
+    "blackwell": {
+      "provenance": [
+        "NVIDIA published blackwell/gb100 dev_ram.h [NVIDIA-published]: RAMFC rearranged - SIGNATURE 0x38, GP_BASE 0x90/0x94 (hi 24:0), GP_GET 0x98, GP_PUT 0xC0 (debug state), LIMIT2 0xB4 bits 28:24, HCE_CTRL 0x54",
+        "CHID: RAMFC 0x58 bits 27:16 on GB1xx/Rubin (RM); GB2xx writes no CHID to RAMFC. RAMIN 0x20C = 0xcafeca11 (RM-written marker)",
+        "USERD words other than GP_PUT are not republished for Blackwell and are assumed unchanged"
+      ],
+      "inherit": "ampere",
+      "drop": {"ramfc": ["gp_put", "gp_get", "gp_base_lo", "gp_base_hi", "signature", "hce_ctrl", "mem_op_a", "pb_get",
+                         "pb_get_hi", "ref", "sem_addr_hi", "sem_addr_lo", "sem_payload_lo", "sem_execute", "pb_put",
+                         "pb_put_hi", "pb_header", "subdevice", "target", "config", "set_channel_info"]},
+      "ramfc": {"signature": "0x38", "gp_base_lo": "0x90", "gp_base_hi": "0x94", "gp_get": "0x98", "gp_put": "0xc0",
+                "hce_ctrl": "0x54", "chid": ["0x58", 27, 16], "gp_limit2": ["0xb4", 28, 24], "gp_base_hi_bits": 25},
+      "ramin": {"magic": ["0x20c", "0xcafeca11"]}
+    }
+  }
+}
