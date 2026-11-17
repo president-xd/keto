@@ -1,0 +1,818 @@
+{
+ "format": "keto-classes/1",
+ "description": "NVIDIA engine class ids (bound with SET_OBJECT) and per-family method tables used by the pushbuffer decoder.",
+ "provenance": {
+  "verified": "Every class id is a '#define NAME (0x0000XXXX)' in an NVIDIA header (open-gpu-doc classes/ or open-gpu-kernel-modules sdk/nvidia/inc/class); 'source' names one such header (docs/research/NVIDIA_COMMAND_FACTS.md section 3.1). SEND_PCAS_A (0x2b4) and SEND_SIGNALING_PCAS_B (0x2bc) are defined identically from KEPLER_COMPUTE_A on. Host SEM_* (0x5c..0x6c) exist from VOLTA_CHANNEL_GPFIFO_A; earlier host classes use SEMAPHOREA..D.",
+  "method_names": "Method names are the newest class's names; a few compute/host offsets are named differently in older classes (NVIDIA_COMMAND_FACTS.md section 8)."
+ },
+ "classes": {
+  "0x900e": {
+   "name": "MPS_COMPUTE",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cl900e.h"
+  },
+  "0x902d": {
+   "name": "FERMI_TWOD_A",
+   "family": "2d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/twod/cl902d.h"
+  },
+  "0x9039": {
+   "name": "FERMI_MEMORY_TO_MEMORY_FORMAT_A",
+   "family": "m2mf",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/memory-to-memory-format/cl9039.h"
+  },
+  "0x906f": {
+   "name": "GF100_CHANNEL_GPFIFO",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/cl906f.h"
+  },
+  "0x9097": {
+   "name": "FERMI_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cl9097.h"
+  },
+  "0x90b5": {
+   "name": "GF100_DMA_COPY",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/cl90b5.h"
+  },
+  "0x90c0": {
+   "name": "FERMI_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/cl90c0.h"
+  },
+  "0x9197": {
+   "name": "FERMI_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cl9197.h"
+  },
+  "0x91c0": {
+   "name": "FERMI_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/cl91c0.h"
+  },
+  "0x9297": {
+   "name": "FERMI_C",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cl9297.h"
+  },
+  "0xa040": {
+   "name": "KEPLER_INLINE_TO_MEMORY_A",
+   "family": "i2m",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/inline-to-memory/cla040.h"
+  },
+  "0xa06f": {
+   "name": "KEPLER_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/cla06f.h"
+  },
+  "0xa097": {
+   "name": "KEPLER_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cla097.h"
+  },
+  "0xa0b0": {
+   "name": "NVA0B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cla0b0.h"
+  },
+  "0xa0b5": {
+   "name": "KEPLER_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/cla0b5.h"
+  },
+  "0xa0c0": {
+   "name": "KEPLER_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/cla0c0.h"
+  },
+  "0xa140": {
+   "name": "KEPLER_INLINE_TO_MEMORY_B",
+   "family": "i2m",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/inline-to-memory/cla140.h"
+  },
+  "0xa16f": {
+   "name": "KEPLER_CHANNEL_GPFIFO_B",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/cla16f.h"
+  },
+  "0xa197": {
+   "name": "KEPLER_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cla197.h"
+  },
+  "0xa1c0": {
+   "name": "KEPLER_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/cla1c0.h"
+  },
+  "0xa26f": {
+   "name": "KEPLER_CHANNEL_GPFIFO_C",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/cla26f.h"
+  },
+  "0xa297": {
+   "name": "KEPLER_C",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/cla297.h"
+  },
+  "0xb06f": {
+   "name": "MAXWELL_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clb06f.h"
+  },
+  "0xb097": {
+   "name": "MAXWELL_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clb097.h"
+  },
+  "0xb0b0": {
+   "name": "NVB0B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb0b0.h"
+  },
+  "0xb0b5": {
+   "name": "MAXWELL_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clb0b5.h"
+  },
+  "0xb0c0": {
+   "name": "MAXWELL_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clb0c0.h"
+  },
+  "0xb197": {
+   "name": "MAXWELL_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clb197.h"
+  },
+  "0xb1c0": {
+   "name": "MAXWELL_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clb1c0.h"
+  },
+  "0xb4b7": {
+   "name": "NVB4B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb4b7.h"
+  },
+  "0xb6b0": {
+   "name": "NVB6B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb6b0.h"
+  },
+  "0xb8b0": {
+   "name": "NVB8B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb8b0.h"
+  },
+  "0xb8d1": {
+   "name": "NVB8D1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb8d1.h"
+  },
+  "0xb8fa": {
+   "name": "NVB8FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clb8fa.h"
+  },
+  "0xc06f": {
+   "name": "PASCAL_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clc06f.h"
+  },
+  "0xc097": {
+   "name": "PASCAL_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc097.h"
+  },
+  "0xc0b5": {
+   "name": "PASCAL_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc0b5.h"
+  },
+  "0xc0b7": {
+   "name": "NVC0B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc0b7.h"
+  },
+  "0xc0c0": {
+   "name": "PASCAL_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc0c0.h"
+  },
+  "0xc197": {
+   "name": "PASCAL_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc197.h"
+  },
+  "0xc1b0": {
+   "name": "NVC1B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc1b0.h"
+  },
+  "0xc1b5": {
+   "name": "PASCAL_DMA_COPY_B",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc1b5.h"
+  },
+  "0xc1b7": {
+   "name": "NVC1B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc1b7.h"
+  },
+  "0xc1c0": {
+   "name": "PASCAL_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc1c0.h"
+  },
+  "0xc2b0": {
+   "name": "NVC2B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc2b0.h"
+  },
+  "0xc2b7": {
+   "name": "NVC2B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc2b7.h"
+  },
+  "0xc36f": {
+   "name": "VOLTA_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clc36f.h"
+  },
+  "0xc397": {
+   "name": "VOLTA_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc397.h"
+  },
+  "0xc3b0": {
+   "name": "NVC3B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc3b0.h"
+  },
+  "0xc3b5": {
+   "name": "VOLTA_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc3b5.h"
+  },
+  "0xc3b7": {
+   "name": "NVC3B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc3b7.h"
+  },
+  "0xc3c0": {
+   "name": "VOLTA_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc3c0.h"
+  },
+  "0xc46f": {
+   "name": "TURING_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clc46f.h"
+  },
+  "0xc4b0": {
+   "name": "NVC4B0_VIDEO_DECODER (Turing NVDEC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc4b0.h"
+  },
+  "0xc4b7": {
+   "name": "NVC4B7_VIDEO_ENCODER (Turing NVENC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc4b7.h"
+  },
+  "0xc4c0": {
+   "name": "VOLTA_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc4c0.h"
+  },
+  "0xc4d1": {
+   "name": "NVC4D1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc4d1.h"
+  },
+  "0xc56f": {
+   "name": "AMPERE_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clc56f.h"
+  },
+  "0xc572": {
+   "name": "PHYSICAL_CHANNEL_GPFIFO",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc572.h"
+  },
+  "0xc597": {
+   "name": "TURING_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc597.h"
+  },
+  "0xc5b0": {
+   "name": "NVC5B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc5b0.h"
+  },
+  "0xc5b5": {
+   "name": "TURING_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc5b5.h"
+  },
+  "0xc5b7": {
+   "name": "NVC5B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc5b7.h"
+  },
+  "0xc5c0": {
+   "name": "TURING_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc5c0.h"
+  },
+  "0xc697": {
+   "name": "AMPERE_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc697.h"
+  },
+  "0xc6b0": {
+   "name": "NVC6B0_VIDEO_DECODER (GA100 NVDEC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc6b0.h"
+  },
+  "0xc6b5": {
+   "name": "AMPERE_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc6b5.h"
+  },
+  "0xc6c0": {
+   "name": "AMPERE_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc6c0.h"
+  },
+  "0xc6fa": {
+   "name": "NVC6FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc6fa.h"
+  },
+  "0xc76f": {
+   "name": "AMPERE_CHANNEL_GPFIFO_B",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/host/clc76f.h"
+  },
+  "0xc797": {
+   "name": "AMPERE_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc797.h"
+  },
+  "0xc7b0": {
+   "name": "NVC7B0_VIDEO_DECODER (Ampere NVDEC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc7b0.h"
+  },
+  "0xc7b5": {
+   "name": "AMPERE_DMA_COPY_B",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc7b5.h"
+  },
+  "0xc7b7": {
+   "name": "NVC7B7_VIDEO_ENCODER (Ampere NVENC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc7b7.h"
+  },
+  "0xc7c0": {
+   "name": "AMPERE_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc7c0.h"
+  },
+  "0xc7fa": {
+   "name": "NVC7FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc7fa.h"
+  },
+  "0xc86f": {
+   "name": "HOPPER_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc86f.h"
+  },
+  "0xc8b5": {
+   "name": "HOPPER_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc8b5.h"
+  },
+  "0xc96f": {
+   "name": "BLACKWELL_CHANNEL_GPFIFO_A",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc96f.h"
+  },
+  "0xc997": {
+   "name": "ADA_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clc997.h"
+  },
+  "0xc9b0": {
+   "name": "NVC9B0_VIDEO_DECODER (Ada NVDEC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc9b0.h"
+  },
+  "0xc9b5": {
+   "name": "BLACKWELL_DMA_COPY_A",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clc9b5.h"
+  },
+  "0xc9b7": {
+   "name": "NVC9B7_VIDEO_ENCODER (Ada NVENC)",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc9b7.h"
+  },
+  "0xc9c0": {
+   "name": "ADA_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clc9c0.h"
+  },
+  "0xc9d1": {
+   "name": "NVC9D1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clc9d1.h"
+  },
+  "0xc9fa": {
+   "name": "NVC9FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clc9fa.h"
+  },
+  "0xca6f": {
+   "name": "BLACKWELL_CHANNEL_GPFIFO_B",
+   "family": "host",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clca6f.h"
+  },
+  "0xcab5": {
+   "name": "BLACKWELL_DMA_COPY_B",
+   "family": "copy",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/dma-copy/clcab5.h"
+  },
+  "0xcb97": {
+   "name": "HOPPER_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clcb97.h"
+  },
+  "0xcbc0": {
+   "name": "HOPPER_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clcbc0.h"
+  },
+  "0xcd40": {
+   "name": "BLACKWELL_INLINE_TO_MEMORY_A",
+   "family": "i2m",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcd40.h"
+  },
+  "0xcd97": {
+   "name": "BLACKWELL_A",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clcd97.h"
+  },
+  "0xcdb0": {
+   "name": "NVCDB0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcdb0.h"
+  },
+  "0xcdc0": {
+   "name": "BLACKWELL_COMPUTE_A",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clcdc0.h"
+  },
+  "0xcdd1": {
+   "name": "NVCDD1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcdd1.h"
+  },
+  "0xcdfa": {
+   "name": "NVCDFA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcdfa.h"
+  },
+  "0xce97": {
+   "name": "BLACKWELL_B",
+   "family": "3d",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/3d/clce97.h"
+  },
+  "0xceb0": {
+   "name": "NVCEB0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clceb0.h"
+  },
+  "0xceb6": {
+   "name": "NVCEB6_VIDEO_COMPOSITOR",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/clceb6.h"
+  },
+  "0xceb7": {
+   "name": "NVCEB7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clceb7.h"
+  },
+  "0xcec0": {
+   "name": "BLACKWELL_COMPUTE_B",
+   "family": "compute",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/compute/clcec0.h"
+  },
+  "0xced0": {
+   "name": "NVCED0_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clced0.h"
+  },
+  "0xcefa": {
+   "name": "NVCEFA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcefa.h"
+  },
+  "0xcfb0": {
+   "name": "NVCFB0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcfb0.h"
+  },
+  "0xcfb7": {
+   "name": "NVCFB7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcfb7.h"
+  },
+  "0xcfd1": {
+   "name": "NVCFD1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcfd1.h"
+  },
+  "0xcffa": {
+   "name": "NVCFFA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/clcffa.h"
+  },
+  "0xd0b7": {
+   "name": "NVD0B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld0b7.h"
+  },
+  "0xd1b0": {
+   "name": "NVD1B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld1b0.h"
+  },
+  "0xd1b7": {
+   "name": "NVD1B7_VIDEO_ENCODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld1b7.h"
+  },
+  "0xd1fa": {
+   "name": "NVD1FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld1fa.h"
+  },
+  "0xd2b0": {
+   "name": "NVD2B0_VIDEO_DECODER",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld2b0.h"
+  },
+  "0xd2d1": {
+   "name": "NVD2D1_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld2d1.h"
+  },
+  "0xd2fa": {
+   "name": "NVD2FA_VIDEO_OFA",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/e6a2e01579fb/src/common/sdk/nvidia/inc/class/cld2fa.h"
+  },
+  "0xe7d0": {
+   "name": "NVE7D0_VIDEO_NVJPG",
+   "family": "video",
+   "verified": true,
+   "source": "https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c406200/classes/video/cle7d0.h"
+  }
+ },
+ "methods": {
+  "host": {
+   "0x0000": "SET_OBJECT",
+   "0x0004": "ILLEGAL",
+   "0x0008": "NOP",
+   "0x0010": "SEMAPHOREA",
+   "0x0014": "SEMAPHOREB",
+   "0x0018": "SEMAPHOREC",
+   "0x001c": "SEMAPHORED",
+   "0x0020": "NON_STALL_INTERRUPT",
+   "0x0024": "FB_FLUSH",
+   "0x0028": "MEM_OP_A",
+   "0x002c": "MEM_OP_B",
+   "0x0030": "MEM_OP_C",
+   "0x0034": "MEM_OP_D",
+   "0x0050": "SET_REFERENCE",
+   "0x005c": "SEM_ADDR_LO",
+   "0x0060": "SEM_ADDR_HI",
+   "0x0064": "SEM_PAYLOAD_LO",
+   "0x0068": "SEM_PAYLOAD_HI",
+   "0x006c": "SEM_EXECUTE",
+   "0x0078": "WFI",
+   "0x0080": "YIELD",
+   "0x0084": "CLEAR_FAULTED"
+  },
+  "copy": {
+   "0x0100": "NOP",
+   "0x0140": "PM_TRIGGER",
+   "0x0240": "SET_SEMAPHORE_A",
+   "0x0244": "SET_SEMAPHORE_B",
+   "0x0248": "SET_SEMAPHORE_PAYLOAD",
+   "0x0260": "SET_SRC_PHYS_MODE",
+   "0x0264": "SET_DST_PHYS_MODE",
+   "0x0300": "LAUNCH_DMA",
+   "0x0400": "OFFSET_IN_UPPER",
+   "0x0404": "OFFSET_IN_LOWER",
+   "0x0408": "OFFSET_OUT_UPPER",
+   "0x040c": "OFFSET_OUT_LOWER",
+   "0x0410": "PITCH_IN",
+   "0x0414": "PITCH_OUT",
+   "0x0418": "LINE_LENGTH_IN",
+   "0x041c": "LINE_COUNT",
+   "0x0700": "SET_REMAP_CONST_A",
+   "0x0704": "SET_REMAP_CONST_B",
+   "0x0708": "SET_REMAP_COMPONENTS",
+   "0x070c": "SET_DST_BLOCK_SIZE",
+   "0x0710": "SET_DST_WIDTH",
+   "0x0714": "SET_DST_HEIGHT",
+   "0x0718": "SET_DST_DEPTH",
+   "0x071c": "SET_DST_LAYER",
+   "0x0720": "SET_DST_ORIGIN",
+   "0x0728": "SET_SRC_BLOCK_SIZE",
+   "0x072c": "SET_SRC_WIDTH",
+   "0x0730": "SET_SRC_HEIGHT",
+   "0x0734": "SET_SRC_DEPTH",
+   "0x0738": "SET_SRC_LAYER",
+   "0x073c": "SET_SRC_ORIGIN",
+   "0x0744": "SRC_ORIGIN_X",
+   "0x0748": "SRC_ORIGIN_Y",
+   "0x074c": "DST_ORIGIN_X",
+   "0x0750": "DST_ORIGIN_Y",
+   "0x1114": "PM_TRIGGER_END"
+  },
+  "compute": {
+   "0x0000": "SET_OBJECT",
+   "0x0100": "NO_OPERATION",
+   "0x0180": "LINE_LENGTH_IN",
+   "0x0184": "LINE_COUNT",
+   "0x0188": "OFFSET_OUT_UPPER",
+   "0x018c": "OFFSET_OUT",
+   "0x0190": "PITCH_OUT",
+   "0x01b0": "LAUNCH_DMA",
+   "0x01b4": "LOAD_INLINE_DATA",
+   "0x0214": "SET_QMD_VIRTUALIZATION_BASE_A",
+   "0x021c": "INVALIDATE_SHADER_CACHES",
+   "0x0244": "INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI",
+   "0x029c": "SET_QMD_VIRTUALIZATION_CONTROL",
+   "0x02a0": "SET_SHADER_SHARED_MEMORY_WINDOW_A",
+   "0x02a4": "SET_SHADER_SHARED_MEMORY_WINDOW_B",
+   "0x02b4": "SEND_PCAS_A",
+   "0x02b8": "SEND_PCAS_B",
+   "0x02bc": "SEND_SIGNALING_PCAS_B",
+   "0x02c0": "SEND_SIGNALING_PCAS2_B",
+   "0x0318": "SET_INLINE_QMD_ADDRESS_A",
+   "0x031c": "SET_INLINE_QMD_ADDRESS_B",
+   "0x0790": "SET_SHADER_LOCAL_MEMORY_A",
+   "0x0794": "SET_SHADER_LOCAL_MEMORY_B",
+   "0x07b0": "SET_SHADER_LOCAL_MEMORY_WINDOW_A",
+   "0x07b4": "SET_SHADER_LOCAL_MEMORY_WINDOW_B",
+   "0x1698": "INVALIDATE_SHADER_CACHES_NO_WFI",
+   "0x1b00": "SET_REPORT_SEMAPHORE_A",
+   "0x1b04": "SET_REPORT_SEMAPHORE_B",
+   "0x1b08": "SET_REPORT_SEMAPHORE_C",
+   "0x1b0c": "SET_REPORT_SEMAPHORE_D"
+  },
+  "3d": {
+   "0x0000": "SET_OBJECT",
+   "0x0100": "NO_OPERATION"
+  },
+  "2d": {
+   "0x0000": "SET_OBJECT",
+   "0x0100": "NO_OPERATION"
+  },
+  "i2m": {
+   "0x0000": "SET_OBJECT",
+   "0x0100": "NO_OPERATION",
+   "0x0180": "LINE_LENGTH_IN",
+   "0x0184": "LINE_COUNT",
+   "0x0188": "OFFSET_OUT_UPPER",
+   "0x018c": "OFFSET_OUT",
+   "0x01b0": "LAUNCH_DMA",
+   "0x01b4": "LOAD_INLINE_DATA"
+  },
+  "video": {
+   "0x0000": "SET_OBJECT",
+   "0x0100": "NOP"
+  }
+ }
+}
