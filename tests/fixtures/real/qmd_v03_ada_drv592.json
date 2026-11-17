@@ -1,0 +1,90 @@
+{
+ "source": "QMD V03_00 launch descriptors written by NVIDIA driver 592.82 (CUDA 13.1) for an RTX 4050 Laptop GPU (Ada, sm_89), recovered from a CUDA process's memory under WSL2 with `keto acquire --method process`",
+ "count": 6,
+ "expected": [
+  {
+   "program_address": 30079921408,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  },
+  {
+   "program_address": 30080003328,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  },
+  {
+   "program_address": 30080085248,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  },
+  {
+   "program_address": 30080167168,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  },
+  {
+   "program_address": 30080249088,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  },
+  {
+   "program_address": 30080331008,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "registers": 16
+  }
+ ]
+}
