@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keto"
+version = "1.0.0"
+description = "GPU memory forensics framework for NVIDIA GPUs, modelled on Volatility 3"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Proprietary - all rights reserved by the project owner" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: System :: Recovery Tools",
+  "Environment :: Console",
+]
+
+[project.optional-dependencies]
+yara = ["yara-python>=4.3"]
+
+[project.scripts]
+keto = "keto.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["keto*"]
+
+[tool.setuptools.package-data]
+"keto" = ["symbols/nvidia/*.json", "rules/*.yar"]
