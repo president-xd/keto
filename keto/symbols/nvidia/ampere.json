@@ -1,0 +1,54 @@
+{
+  "format": "keto-profile/1",
+  "name": "ampere",
+  "vendor": "nvidia",
+  "architecture": "Ampere",
+  "family": "GA100/GA10x/GA10B",
+  "nvml_arch": 7,
+  "compute_capabilities": [
+    "8.0",
+    "8.6",
+    "8.7"
+  ],
+  "chipsets": {
+    "0x170": "GA100",
+    "0x172": "GA102",
+    "0x173": "GA103",
+    "0x174": "GA104",
+    "0x176": "GA106",
+    "0x177": "GA107",
+    "0x17b": "GA10B (Orin)"
+  },
+  "name_patterns": [
+    "RTX 30",
+    "A100",
+    "A30",
+    "A40",
+    "A10",
+    "A16",
+    "A2",
+    "RTX A",
+    "GA10"
+  ],
+  "mmu": {
+    "format": "v2",
+    "va_bits": 49,
+    "big_page_sizes": [
+      65536
+    ]
+  },
+  "layout": "ampere",
+  "qmd": "auto",
+  "classes": {
+    "host": "0xC56F",
+    "compute": "0xC7C0",
+    "copy": "0xC7B5",
+    "3d": "0xC797"
+  },
+  "provenance": [
+    "GMMU VER2 PDE/dual-PDE/PTE: NVIDIA published pascal/gp100 dev_mmu.h; 5-level split 2/9/9/8/9(+12); 2 MiB pages at PD0, 512 MiB at PD1 (Ampere+) (NVIDIA_HW_FACTS.md 4.2, topic 6).",
+    "Chipset ids (NV_PMC_BOOT_0[28:20]), NVML architecture ids and CUDA compute capabilities: docs/research/NVIDIA_HW_FACTS.md section 5 (ids marked 'derived' are not listed by any source).",
+    "Engine classes per chip: docs/research/NVIDIA_COMMAND_FACTS.md section 0 (nouveau/GSP-RM/nvgpu tables).",
+    "QMD version is read from each descriptor (all published layouts V00_06..V05_00 are decoded)."
+  ]
+}
