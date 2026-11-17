@@ -1,0 +1,55 @@
+{
+  "format": "keto-profile/1",
+  "name": "maxwell",
+  "vendor": "nvidia",
+  "architecture": "Maxwell",
+  "family": "GM10x/GM20x/GM20B",
+  "nvml_arch": 3,
+  "compute_capabilities": [
+    "5.0",
+    "5.2",
+    "5.3"
+  ],
+  "chipsets": {
+    "0x117": "GM107",
+    "0x118": "GM108",
+    "0x120": "GM200",
+    "0x124": "GM204",
+    "0x126": "GM206",
+    "0x12b": "GM20B (Tegra X1)",
+    "0x12e": "GM20B_B"
+  },
+  "name_patterns": [
+    "GTX 9",
+    "GTX 750",
+    "GTX 745",
+    "Tesla M",
+    "Quadro M",
+    "TITAN X (Maxwell)",
+    "GM1",
+    "GM2"
+  ],
+  "mmu": {
+    "format": "v1",
+    "va_bits": 40,
+    "big_page_sizes": [
+      131072,
+      65536
+    ]
+  },
+  "layout": "maxwell_pascal",
+  "qmd": "auto",
+  "classes": {
+    "host": "0xB06F",
+    "compute": "0xB1C0",
+    "copy": "0xB0B5",
+    "3d": "0xB197"
+  },
+  "provenance": [
+    "GMMU VER1 (40-bit VA, dual big/small PDE, 64/128 KiB big pages): NVIDIA published maxwell/gm107 dev_mmu.h; split from nouveau gf100/gk104/gm200 VMM descriptors (NVIDIA_HW_FACTS.md 1.2-1.8).",
+    "Chipset ids (NV_PMC_BOOT_0[28:20]), NVML architecture ids and CUDA compute capabilities: docs/research/NVIDIA_HW_FACTS.md section 5 (ids marked 'derived' are not listed by any source).",
+    "Engine classes per chip: docs/research/NVIDIA_COMMAND_FACTS.md section 0 (nouveau/GSP-RM/nvgpu tables).",
+    "QMD version is read from each descriptor (all published layouts V00_06..V05_00 are decoded).",
+    "Before GM20x the big page size is a global register (default 128 KiB), not in the instance block: override with --big-page 64K if the driver was configured for 64 KiB."
+  ]
+}
