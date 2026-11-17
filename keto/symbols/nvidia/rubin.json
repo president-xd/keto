@@ -1,0 +1,39 @@
+{
+  "format": "keto-profile/1",
+  "name": "rubin",
+  "vendor": "nvidia",
+  "architecture": "Rubin",
+  "family": "GR10x",
+  "nvml_arch": 13,
+  "compute_capabilities": [],
+  "chipsets": {
+    "0x1c0": "GR100 (derived id)",
+    "0x1c2": "GR102 (derived id)"
+  },
+  "name_patterns": [
+    "Rubin",
+    "GR10"
+  ],
+  "mmu": {
+    "format": "v3",
+    "va_bits": 57,
+    "big_page_sizes": [
+      65536
+    ]
+  },
+  "layout": "blackwell",
+  "qmd": "auto",
+  "classes": {
+    "host": "0xC96F",
+    "compute": "0xCDC0",
+    "copy": "0xC9B5",
+    "3d": "0xCD97"
+  },
+  "provenance": [
+    "GMMU VER3 incl. PCF: NVIDIA published hopper/gh100 dev_mmu.h; 6-level split 1/9/9/9/8/9(+12) per RM/nouveau gh100 descriptors; Blackwell adds 256 GiB pages at PD2 (NVIDIA_HW_FACTS.md 4.2-4.4).",
+    "Chipset ids (NV_PMC_BOOT_0[28:20]), NVML architecture ids and CUDA compute capabilities: docs/research/NVIDIA_HW_FACTS.md section 5 (ids marked 'derived' are not listed by any source).",
+    "Engine classes per chip: docs/research/NVIDIA_COMMAND_FACTS.md section 0 (nouveau/GSP-RM/nvgpu tables).",
+    "QMD version is read from each descriptor (all published layouts V00_06..V05_00 are decoded).",
+    "Rubin: chip ids derived and classes assumed equal to Blackwell - forward-compatibility only."
+  ]
+}
