@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import re
 import struct
 
@@ -12,10 +13,12 @@ from keto.formats import ptx as ptx_fmt
 from keto.formats.elf import elf_extent
 from keto.framework.exceptions import UnsupportedError
 from keto.framework.plugin import Plugin, Requirement, TimeLinerInterface
-from keto.framework.treegrid import Address, TreeGrid, na
+from keto.framework.treegrid import Address, NotAvailableValue, TreeGrid, na
 from keto.framework.util import utc_from_epoch
 from keto.indicators import miners
 from keto.live import procfs
+from keto.live.source import NotRecordedError
+from keto.plugins.windows import gpu as wgpu
 
 
 def _gpu_memory(nvml: dict, pid: int):
@@ -38,17 +41,24 @@ class PsList(Plugin, TimeLinerInterface):
                    "evidence that ties each one to the GPU.")
     METHOD = ("Merges NVML nvmlDeviceGet{Compute,Graphics,MPSCompute}RunningProcesses_v3 with a /proc walk: "
               "open GPU device nodes (/proc/<pid>/fd -> /dev/nvidia*, /dev/dxg) and mapped CUDA/NVIDIA runtime "
-              "libraries (/proc/<pid>/maps). NVML PIDs absent from /proc are kept and marked.")
+              "libraries (/proc/<pid>/maps). NVML PIDs absent from /proc are kept and marked. On Windows the "
+              "process view is Toolhelp32 (name, PPID), QueryFullProcessImageNameW (image) and GetProcessTimes "
+              "(start), and the evidence is NVML, the Windows GPU counters (PDH GPU Engine / GPU Process Memory) "
+              "and GPU runtime DLLs in the module list; GPU memory falls back to the counters' dedicated usage when "
+              "NVML (WDDM) has no per-process figure. Keto's own process is not listed.")
     ANALOG = "windows.pslist / linux.pslist"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("pid", int, None, "only this PID")]
 
     def _procs(self):
-        return procfs.gpu_processes(self.ctx.live)
+        src = self.ctx.live
+        return win_gpu_procs(self.ctx) if src.is_windows else procfs.gpu_processes(src)
 
     def run(self):
         src = self.ctx.live
         nv = src.nvml()
+        if src.is_windows:
+            return self._windows(src, nv)
 
         def rows():
             for pid, info in sorted(self._procs().items()):
@@ -59,15 +69,35 @@ class PsList(Plugin, TimeLinerInterface):
                           p["uid"] if p else na(""), utc_from_epoch(p["start_time"]) if p and p["start_time"]
                           else na("unknown"), _gpu_memory(nv, pid), ",".join(sorted(info["evidence"])),
                           procfs.exe_path(p) or na("unreadable"))
-        return TreeGrid([("PID", int), ("PPID", int), ("Name", str), ("UID", int), ("Started", object),
-                         ("GPU Memory", int), ("Evidence", str), ("Exe", str)], rows())
+        return TreeGrid(PSLIST_COLUMNS, rows())
+
+    def _windows(self, src, nv):
+        counters = src.win_gpu().get("processes") or {}
+
+        def rows():
+            for pid, info in sorted(self._procs().items()):
+                if self.opts["pid"] is not None and pid != self.opts["pid"]:
+                    continue
+                p = info["proc"]
+                mem = _gpu_memory(nv, pid)
+                if isinstance(mem, NotAvailableValue) and str(pid) in counters:
+                    mem = counters[str(pid)].get("dedicated") or 0
+                yield 0, (pid, p["ppid"] if p else na("not in process list"), win_name(p), na("Windows"),
+                          utc_from_epoch(p["start_time"]) if p and p.get("start_time") else na("unknown"), mem,
+                          ",".join(sorted(info["evidence"])),
+                          (p or {}).get("path") or na("access denied" if p else "not in process list"))
+        return TreeGrid(PSLIST_COLUMNS, rows())
 
     def generate_timeline(self):
         for pid, info in self._procs().items():
             p = info["proc"]
             if p and p.get("start_time"):
-                yield ("GPU process %s (%d) started" % (procfs.proc_name(p), pid), "Created",
-                       utc_from_epoch(p["start_time"]))
+                name = win_name(p) if self.ctx.live.is_windows else procfs.proc_name(p)
+                yield ("GPU process %s (%d) started" % (name, pid), "Created", utc_from_epoch(p["start_time"]))
+
+
+PSLIST_COLUMNS = [("PID", int), ("PPID", int), ("Name", str), ("UID", int), ("Started", object), ("GPU Memory", int),
+                  ("Evidence", str), ("Exe", str)]
 
 
 # =====================================================================================================
@@ -87,6 +117,126 @@ LOADER_ENV = ("VK_INSTANCE_LAYERS", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "VK_IC
 def gpu_procs(ctx):
     """Cached ``procfs.gpu_processes`` for the context's live source."""
     return ctx.cached("live:gpu_processes", lambda: procfs.gpu_processes(ctx.live))
+
+
+def win_gpu_procs(ctx):
+    """Cached Windows GPU-process set (``windows.gpu.win_gpu_processes``): ``pid -> {proc, evidence, modules}``."""
+    return ctx.cached("live:win_gpu_processes", lambda: wgpu.win_gpu_processes(ctx.live, win_all_modules(ctx)))
+
+
+def win_all_modules(ctx):
+    """Cached module list of every Windows process: ``pid -> [module] | None`` (None: access denied)."""
+    src = ctx.live
+    return ctx.cached("live:win_modules", lambda: {p["pid"]: src.win_modules(p["pid"]) for p in src.win_processes()})
+
+
+def win_name(p) -> str:
+    return (p or {}).get("name") or "?"
+
+
+DISPLAY_CLASS = r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+SERVICES_KEY = r"HKLM\SYSTEM\CurrentControlSet\Services"
+NVLDDMKM_KEY = SERVICES_KEY + r"\nvlddmkm"
+#: where RmProfilingAdminOnly (GPU performance counters for administrators only) is set on Windows
+RM_PROFILING_KEYS = (NVLDDMKM_KEY + r"\Global\NVTweak", NVLDDMKM_KEY + r"\Parameters\Global\NVTweak",
+                     NVLDDMKM_KEY + r"\Parameters", NVLDDMKM_KEY)
+
+
+def display_adapter_keys(src, nvidia_only: bool = False):
+    """``[(key path, values)]`` of the display-class driver instance keys (``...\\{4d36e968-...}\\0000``...)."""
+    out = []
+    for sub in (src.registry_key(DISPLAY_CLASS) or {}).get("subkeys", []):
+        if not re.match(r"^\d{4}$", sub):
+            continue
+        path = DISPLAY_CLASS + "\\" + sub
+        vals = (src.registry_key(path) or {}).get("values") or {}
+        nvidia = "nvidia" in str(vals.get("ProviderName", "")).lower() or \
+            str(vals.get("MatchingDeviceId", "")).lower().startswith("pci\\ven_10de")
+        if nvidia or not nvidia_only:
+            out.append((path, vals))
+    return out
+
+
+#: display-class values naming the files of a display driver (user-mode driver and API drivers)
+DRIVER_FILE_VALUES = ("UserModeDriverName", "UserModeDriverNameWow", "OpenCLDriverName", "OpenCLDriverNameWow",
+                      "OpenGLDriverName", "OpenGLDriverNameWow", "VulkanDriverName", "VulkanDriverNameWow")
+
+
+def win_driver_files(src):
+    """``[(role, path)]`` of the NVIDIA display driver's files named in the registry: the kernel-mode driver
+    (nvlddmkm ImagePath), the user-mode/API drivers of the NVIDIA display-class key, its DriverSupportModules
+    (System32/SysWOW64 copy, else the driver-store folder) and System32\\nvml.dll / nvidia-smi.exe."""
+    out, seen = [], set()
+
+    def add(role, path):
+        if isinstance(path, str) and path and path.lower() not in seen:
+            seen.add(path.lower())
+            out.append((role, path))
+    root = wgpu.system_root(src)
+    image = ((src.registry_key(NVLDDMKM_KEY) or {}).get("values") or {}).get("ImagePath")
+    kmd = wgpu.win_path(src, str(image)) if image else ""
+    add("kernel-mode driver", kmd)
+    store = ntpath.dirname(kmd)
+    for _key, vals in display_adapter_keys(src, nvidia_only=True):
+        low = {k.lower(): v for k, v in vals.items()}
+        for name in DRIVER_FILE_VALUES:
+            v = low.get(name.lower())
+            for path in v if isinstance(v, list) else [v]:
+                add(name, path)
+        for name, sysdir in (("driversupportmodules", "System32"), ("driversupportmoduleswow", "SysWOW64")):
+            for mod in low.get(name) or []:
+                if "\\" not in mod:
+                    copy = "%s\\%s\\%s" % (root, sysdir, mod)
+                    mod = copy if src.stat(copy) is not None or not store else ntpath.join(store, mod)
+                add("DriverSupportModules", mod)
+    add("NVML", root + "\\System32\\nvml.dll")
+    add("nvidia-smi", root + "\\System32\\nvidia-smi.exe")
+    return out
+
+
+def win_rm_profiling(src):
+    """``[(registry key, value)]`` of every RmProfilingAdminOnly value set for the NVIDIA driver."""
+    found = []
+    for key in RM_PROFILING_KEYS:
+        v = ((src.registry_key(key) or {}).get("values") or {}).get("RmProfilingAdminOnly")
+        if v is not None:
+            found.append((key, v))
+    for key, vals in display_adapter_keys(src, nvidia_only=True):
+        if vals.get("RmProfilingAdminOnly") is not None:
+            found.append((key, vals["RmProfilingAdminOnly"]))
+    return found
+
+
+#: NVIDIA and GPU-API DLLs recognised in Windows module lists
+WIN_GPU_DLL_RE = re.compile(
+    r"^(nvcuda\w*|nvapi\w*|nvwgf2um\w*|nvldumd\w*|nvd3dum\w*|nvoglv\w*|nvopencl\w*|nvml|nvencodeapi\w*|nvfbc\w*|"
+    r"nvifr\w*|nvcuvid\w*|nvptxjitcompiler\w*|nvcudadebugger|nvoptix\w*|nvgpucomp\w*|nvrtc\w*|nvjitlink\w*|"
+    r"cudart\w*|cublas\w*|cudnn\w*|cufft\w*|curand\w*|cusparse\w*|cusolver\w*|nccl\w*|cupti\w*|nvperf\w*|"
+    r"nvtoolsext\w*|opencl|vulkan-1|d3d12|d3d12core|dxcore|directml)\.dll$", re.I)
+#: temporary and download locations on Windows (the counterpart of /tmp, /dev/shm)
+WIN_TEMP_RE = re.compile(r"\\(?:temp|tmp|downloads)\\|\\users\\public\\", re.I)
+WIN_PROFILER_DLLS = ("cupti", "nvperf", "nvtoolsext", "nvtx")
+WIN_CAPTURE_DLLS = ("nvfbc", "nvifr", "nvencodeapi")
+WIN_DEBUG_DLLS = ("nvcudadebugger",)
+
+
+def win_dlls(mods, prefixes):
+    """File names of modules whose (lower-case) name starts with one of ``prefixes``."""
+    return sorted({m.get("name") or wgpu.basename(m.get("path", "")) for m in mods or []
+                   if (m.get("name") or "").lower().startswith(prefixes)})
+
+
+def win_env(src, pid):
+    """``(environment dict or None, reason when None)`` of a Windows process from its PEB."""
+    try:
+        info = src.win_process_info(pid)
+    except NotRecordedError:
+        return None, "not recorded in snapshot"
+    if info is None:
+        return None, "process not readable (access denied)"
+    if info.get("environ") is None:
+        return None, "environment block unreadable"
+    return info["environ"], ""
 
 
 def all_procs(ctx):
@@ -127,6 +277,21 @@ def path_risk(src, path: str):
         return True, "temporary / shared-memory location"
     if path.startswith(HOME_PREFIXES):
         return True, "user home directory (user-writable)"
+    if src.stat(path) is None:
+        return True, "referenced file does not exist"
+    return False, ""
+
+
+def win_path_risk(src, path: str):
+    """``(suspicious, reason)`` for a DLL or manifest path named in Windows configuration (registry)."""
+    if not path:
+        return False, ""
+    if "\\" not in path and "/" not in path:
+        return False, "bare name resolved through the DLL search path"
+    if WIN_TEMP_RE.search(path):
+        return True, "temporary / download location"
+    if wgpu.USER_WRITABLE.search(path):
+        return True, "user-writable location"
     if src.stat(path) is None:
         return True, "referenced file does not exist"
     return False, ""
@@ -182,8 +347,14 @@ def modprobe_entries(src):
     return out
 
 
-def env_finding(key: str, value: str):
-    """``(suspicious, reason)`` for one environment variable of a GPU process."""
+def env_finding(key: str, value: str, windows: bool = False):
+    """``(suspicious, reason)`` for one environment variable of a GPU process. Windows variable names are
+    case-insensitive and its temporary/user-writable locations are AppData, Temp, Downloads..."""
+    if windows:
+        key = key.upper()
+        if key in LOADER_ENV:
+            temp = bool(wgpu.USER_WRITABLE.search(value) or WIN_TEMP_RE.search(value))
+            return temp, "GPU API loader override" + (" pointing to a user-writable directory" if temp else "")
     if key in ("LD_PRELOAD", "LD_AUDIT"):
         return True, "library injected into the process by the dynamic loader (%s)" % key
     if key in ("CUDA_INJECTION64_PATH", "CUDA_INJECTION32_PATH"):
@@ -225,12 +396,60 @@ class PsTree(Plugin):
     DESCRIPTION = ("Shows GPU processes inside their process tree, including every non-GPU ancestor up to init, "
                    "so the launcher of each GPU workload is visible.")
     METHOD = ("Starts from the nvidia.pslist set (NVML process lists + /proc GPU evidence) and follows PPid from "
-              "/proc/<pid>/status upwards; ancestors without GPU evidence are included and marked GPU=False.")
+              "/proc/<pid>/status upwards; ancestors without GPU evidence are included and marked GPU=False. On "
+              "Windows the parent links are Toolhelp32 PPIDs (a parent that started after its child holds a reused "
+              "PID and is not linked) and command lines come from each PEB.")
     ANALOG = "windows.pstree / linux.pstree"
     SOURCES = ("live",)
 
+    def _windows(self, src):
+        procs = win_gpu_procs(self.ctx)
+        by_pid = {p["pid"]: p for p in src.win_processes()}
+        nodes = {pid: info["proc"] for pid, info in procs.items()}
+        parent_of = {}
+        for pid in list(nodes):
+            p, seen = nodes[pid], set()
+            while p:
+                parent = by_pid.get(p.get("ppid"))
+                if not parent or parent["pid"] in (p["pid"], 0) or parent["pid"] in seen:
+                    break
+                if p.get("start_time") and parent.get("start_time") and parent["start_time"] > p["start_time"]:
+                    break  # the real parent exited and its PID was reused
+                parent_of[p["pid"]] = parent["pid"]
+                if parent["pid"] in nodes:
+                    break
+                seen.add(parent["pid"])
+                nodes[parent["pid"]] = parent
+                p = parent
+        children, roots = {}, []
+        for pid in nodes:
+            ppid = parent_of.get(pid)
+            if ppid in nodes:
+                children.setdefault(ppid, []).append(pid)
+            else:
+                roots.append(pid)
+
+        def walk(pid, depth, guard):
+            p = nodes.get(pid)
+            info = procs.get(pid)
+            cmd = src.win_cmdline(pid) if p else None
+            yield depth, (pid, p["ppid"] if p else na("not in process list"), win_name(p), info is not None,
+                          ",".join(sorted(info["evidence"])) if info else "",
+                          cmd if cmd else na("empty/unreadable"))
+            for c in sorted(children.get(pid, [])):
+                if c not in guard:
+                    yield from walk(c, depth + 1, guard | {c})
+
+        def rows():
+            for r in sorted(roots):
+                yield from walk(r, 0, {r})
+        return TreeGrid([("PID", int), ("PPID", int), ("Name", str), ("GPU", bool), ("Evidence", str),
+                         ("Cmdline", str)], rows())
+
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
         procs = gpu_procs(self.ctx)
         nodes = {pid: info["proc"] for pid, info in procs.items()}
         for pid in list(nodes):
@@ -269,12 +488,26 @@ class CmdLine(Plugin):
     NAME = "nvidia.cmdline"
     CATEGORY = "nvidia.processes"
     DESCRIPTION = "Shows the full command line and executable of every GPU process."
-    METHOD = "Reads /proc/<pid>/cmdline (NUL-separated argv) and the /proc/<pid>/exe link for each nvidia.pslist PID."
+    METHOD = ("Reads /proc/<pid>/cmdline (NUL-separated argv) and the /proc/<pid>/exe link for each nvidia.pslist "
+              "PID; on Windows the PEB's ProcessParameters->CommandLine and QueryFullProcessImageNameW.")
     ANALOG = "windows.cmdline / linux.psaux"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("pid", int, None, "only this PID")]
 
     def run(self):
+        src = self.ctx.live
+        if src.is_windows:
+            def wrows():
+                for pid, info in sorted(win_gpu_procs(self.ctx).items()):
+                    p = info["proc"]
+                    if not pid_filter(self.opts, pid):
+                        continue
+                    cmd = src.win_cmdline(pid) if p else None
+                    yield 0, (pid, win_name(p), (p or {}).get("path") or na("access denied" if p else
+                                                                            "not in process list"),
+                              cmd if cmd else na("empty/unreadable"))
+            return TreeGrid([("PID", int), ("Name", str), ("Exe", str), ("Args", str)], wrows())
+
         def rows():
             for pid, info in sorted(gpu_procs(self.ctx).items()):
                 if not pid_filter(self.opts, pid):
@@ -293,7 +526,9 @@ class Envars(Plugin):
                    "temporary directories).")
     METHOD = ("Reads /proc/<pid>/environ (reduced at the source to GPU/loader-relevant keys for privacy) and "
               "classifies each key: injection hooks are suspicious; GPU selection, MPS, ComputeCache and debugger "
-              "settings are reported as context.")
+              "settings are reported as context. On Windows the environment block comes from each GPU process's "
+              "PEB (ProcessParameters->Environment via ReadProcessMemory), reduced the same way, with names "
+              "compared case-insensitively.")
     ANALOG = "windows.envars / linux.envars"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("pid", int, None, "only this PID"),
@@ -301,23 +536,36 @@ class Envars(Plugin):
                     Requirement("all", bool, False, "also show retained variables with no finding (PATH, HOME...)")]
 
     def run(self):
-        def rows():
+        src = self.ctx.live
+        windows = src.is_windows
+        if not (windows or src.is_linux):
+            require_linux(src, self.NAME)
+
+        def environments():
+            if windows:
+                for pid, info in sorted(win_gpu_procs(self.ctx).items()):
+                    if pid_filter(self.opts, pid) and info["proc"] is not None:
+                        env, why = win_env(src, pid)
+                        yield pid, win_name(info["proc"]), env, why
+                return
             for pid, info in sorted(gpu_procs(self.ctx).items()):
                 p = info["proc"]
-                if not pid_filter(self.opts, pid) or p is None:
-                    continue
-                env = p.get("environ")
+                if pid_filter(self.opts, pid) and p is not None:
+                    yield pid, procfs.proc_name(p), p.get("environ"), "environ unreadable (permission)"
+
+        def rows():
+            for pid, name, env, why in environments():
                 if env is None:
                     if not self.opts["suspicious_only"]:
-                        yield 0, (pid, procfs.proc_name(p), na("environ unreadable (permission)"), na(""), False, "")
+                        yield 0, (pid, name, na(why), na(""), False, "")
                     continue
                 for k in sorted(env):
-                    sus, reason = env_finding(k, env[k])
+                    sus, reason = env_finding(k, env[k], windows)
                     if self.opts["suspicious_only"] and not sus:
                         continue
                     if not reason and not self.opts["all"]:
                         continue
-                    yield 0, (pid, procfs.proc_name(p), k, env[k], sus, reason)
+                    yield 0, (pid, name, k, env[k], sus, reason)
         return TreeGrid([("PID", int), ("Name", str), ("Variable", str), ("Value", str), ("Suspicious", bool),
                          ("Reason", str)], rows())
 
@@ -350,16 +598,50 @@ def node_kind(target: str) -> str:
 class Handles(Plugin):
     NAME = "nvidia.handles"
     CATEGORY = "nvidia.processes"
-    DESCRIPTION = "Lists every open GPU device-node file descriptor per process (control, GPU, UVM, modeset, caps, dxg)."
+    DESCRIPTION = ("Lists every open GPU device-node file descriptor per process (control, GPU, UVM, modeset, caps, "
+                   "dxg); on Windows every open handle to a GPU object or file (DxgKrnl/NVIDIA devices, the CUDA "
+                   "driver's kernel archive, shader and JIT caches in use, NVIDIA capture components).")
     METHOD = ("Resolves each /proc/<pid>/fd/<n> symlink and keeps targets matching /dev/nvidia*, /dev/nvidia-caps/*, "
               "/dev/dxg and DRM nodes; the node type tells what the process can do (e.g. nvidia-uvm-tools = event "
-              "tracing, nvidiactl = RM object allocation).")
+              "tracing, nvidiactl = RM object allocation). Windows (where GPU work goes through dxgkrnl system calls, "
+              "not a device file): one snapshot of the system handle table (NtQuerySystemInformation "
+              "SystemExtendedHandleInformation); each File handle is duplicated into Keto (PROCESS_DUP_HANDLE: same "
+              "user, or Administrator) and named with NtQueryObject in a worker thread with a timeout (a name query "
+              "on a synchronous file object can block; a stuck worker is abandoned); only GPU-related names are kept, "
+              "with their NT paths.")
     ANALOG = "windows.handles / linux.lsof"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("pid", int, None, "only this PID")]
 
+    def _windows(self, src):
+        self_pid = (src.platform() or {}).get("self_pid")
+
+        def rows():
+            unchecked = []
+            for p in sorted(src.win_processes(), key=lambda x: x["pid"]):
+                pid = p["pid"]
+                if pid in (0, 4) or pid == self_pid or not pid_filter(self.opts, pid):
+                    continue
+                try:
+                    info = src.win_handles(pid)
+                except NotRecordedError:
+                    info = None
+                if info is None:
+                    unchecked.append(pid)
+                    continue
+                for h in info.get("handles", []):
+                    yield 0, (pid, win_name(p), h["handle"], h["name"], h["kind"])
+            if unchecked:
+                self.log.warning("%d process(es) not checked: their handles cannot be duplicated (run as "
+                                 "Administrator for other users' and service processes): %s", len(unchecked),
+                                 ", ".join(map(str, unchecked[:20])))
+        return TreeGrid([("PID", int), ("Name", str), ("FD", int), ("Device", str), ("Kind", str)], rows())
+
     def run(self):
-        require_linux(self.ctx.live, self.NAME)
+        src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
+        require_linux(src, self.NAME)
 
         def rows():
             for pid, p in sorted(all_procs(self.ctx).items()):
@@ -377,13 +659,45 @@ class Libs(Plugin):
                    "dxcore) mapped in each GPU process, plus any library mapped from a temporary, deleted or "
                    "fileless location.")
     METHOD = ("Groups /proc/<pid>/maps entries by backing file; GPU libraries are recognised by name; paths under "
-              "/tmp, /var/tmp, /dev/shm, /run/user, memfd: or marked '(deleted)' are flagged.")
+              "/tmp, /var/tmp, /dev/shm, /run/user, memfd: or marked '(deleted)' are flagged. On Windows the module "
+              "list (Toolhelp32 module snapshot) of each GPU process is used: NVIDIA/GPU-API DLLs are recognised by "
+              "name, any DLL from a Temp/Downloads/Public folder and GPU DLLs from a user-writable folder (AppData, "
+              "ProgramData, Desktop...) are flagged; module protections are not part of that list.")
     ANALOG = "windows.dlllist / linux.library_list"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("pid", int, None, "only this PID"),
                     Requirement("all_libs", bool, False, "list every file-backed mapping, not only GPU/suspicious ones")]
 
+    def _windows(self):
+        def rows():
+            for pid, info in sorted(win_gpu_procs(self.ctx).items()):
+                p = info["proc"]
+                if p is None or not pid_filter(self.opts, pid):
+                    continue
+                if info["modules"] is None:
+                    yield 0, (pid, win_name(p), na(""), na(""), na(""), na("module list unreadable (access denied)"),
+                              False, False, "")
+                    continue
+                for m in sorted(info["modules"], key=lambda x: x.get("base") or 0):
+                    path = m.get("path") or m.get("name") or ""
+                    gpu = bool(WIN_GPU_DLL_RE.match(m.get("name") or ""))
+                    temp = bool(WIN_TEMP_RE.search(path))
+                    writable_gpu = gpu and bool(wgpu.USER_WRITABLE.search(path))
+                    if not (gpu or temp or self.opts["all_libs"]):
+                        continue
+                    reason = "temporary / download location" if temp else \
+                        "GPU library loaded from a user-writable location" if writable_gpu else ""
+                    base = m.get("base") or 0
+                    yield 0, (pid, win_name(p), Address(base), Address(base + (m.get("size") or 0)), na(""), path,
+                              gpu, temp or writable_gpu, reason)
+        return TreeGrid(LIBS_COLUMNS, rows())
+
     def run(self):
+        src = self.ctx.live
+        if src.is_windows:
+            return self._windows()
+        require_linux(src, self.NAME)
+
         def rows():
             for pid, info in sorted(gpu_procs(self.ctx).items()):
                 p = info["proc"]
@@ -407,8 +721,11 @@ class Libs(Plugin):
                         reason = "temporary / shared-memory location"
                     yield 0, (pid, procfs.proc_name(p), Address(e["base"]), Address(e["end"]), e["perms"], path,
                               gpu, sus, reason)
-        return TreeGrid([("PID", int), ("Name", str), ("Base", Address), ("End", Address), ("Perms", str),
-                         ("Path", str), ("GPU library", bool), ("Suspicious", bool), ("Reason", str)], rows())
+        return TreeGrid(LIBS_COLUMNS, rows())
+
+
+LIBS_COLUMNS = [("PID", int), ("Name", str), ("Base", Address), ("End", Address), ("Perms", str), ("Path", str),
+                ("GPU library", bool), ("Suspicious", bool), ("Reason", str)]
 
 
 def nvml_devices(src):
@@ -480,6 +797,13 @@ class Accounting(Plugin, TimeLinerInterface):
                     yield 0, (d.get("index"), na(""), "", na(""), bad or na("not collected"), na(""), na(""), na(""),
                               na(""))
                     continue
+                mode = d.get("accounting_mode")
+                if not acc and mode != 1:
+                    state = "disabled" if mode == 0 else "unknown (%s)" % (_na_of(mode) or mode)
+                    yield 0, (d.get("index"), na(""), "", na(""),
+                              na("accounting mode %s: no history is recorded (enable with nvidia-smi -am 1)" % state),
+                              na(""), na(""), na(""), na(""))
+                    continue
                 for pid_s, st in sorted(acc.items(), key=lambda kv: int(kv[0])):
                     pid = int(pid_s)
                     if _na_of(st) is not None:
@@ -512,6 +836,7 @@ class Accounting(Plugin, TimeLinerInterface):
 
 DEBUG_TOOLS = {"cuda-gdb", "cuda-gdbserver", "nsys", "ncu", "ncu-ui", "nsight-sys", "nsys-ui", "compute-sanitizer",
                "cuda-memcheck", "nv-nsight-cu-cli"}
+WIN_DEBUG_TOOLS = {"ngfx.exe", "ngfx-ui.exe", "ngfx-capture.exe"}  # Nsight Graphics
 
 
 class Debugger(Plugin):
@@ -521,11 +846,56 @@ class Debugger(Plugin):
                    "ptrace-attached by another process, and running GPU debugger/profiler tools.")
     METHOD = ("Looks for libcudadebugger.so in /proc/<pid>/maps, TracerPid in /proc/<pid>/status for GPU "
               "processes, tool names (cuda-gdb, nsys, ncu, compute-sanitizer...) in comm/exe, and CUDA debugger "
-              "environment settings.")
+              "environment settings. On Windows: nvcudadebugger.dll in any process's module list, "
+              "NtQueryInformationProcess(ProcessDebugPort) for GPU processes (a user-mode debugger is attached), "
+              "Nsight/CUDA tool image names (nsys, ncu, ngfx, compute-sanitizer...) and the same variables in the "
+              "PEB environment.")
     ANALOG = "windows.debugregisters / linux.ptrace"
     SOURCES = ("live",)
 
+    def _windows(self, src):
+        gpu = win_gpu_procs(self.ctx)
+        mods = win_all_modules(self.ctx)
+        tools = {t + ".exe" for t in DEBUG_TOOLS} | WIN_DEBUG_TOOLS
+        self_pid = (src.platform() or {}).get("self_pid")
+
+        def rows():
+            unchecked = []
+            for p in sorted(src.win_processes(), key=lambda x: x["pid"]):
+                pid, name = p["pid"], win_name(p)
+                if pid == self_pid:
+                    continue
+                for dll in win_dlls(mods.get(pid), WIN_DEBUG_DLLS):
+                    yield 0, (pid, name, "CUDA debugger backend loaded",
+                              "%s loaded: the process can be (or is being) debugged on the GPU" % dll)
+                if name.lower() in tools:
+                    yield 0, (pid, name, "GPU debugger/profiler tool running",
+                              src.win_cmdline(pid) or p.get("path") or "")
+                if pid not in gpu:
+                    continue
+                try:
+                    info = src.win_process_info(pid) or {}
+                except NotRecordedError:
+                    info = {}
+                if info.get("debugged") is None and pid not in (0, 4):
+                    unchecked.append(pid)
+                if info.get("debugged"):
+                    yield 0, (pid, name, "debugger attached", "ProcessDebugPort is set: a user-mode debugger is "
+                                                              "attached to this GPU process")
+                env = info.get("environ") or {}
+                for k in sorted(env):
+                    if k.upper() in ("CUDA_DEBUGGER_SOFTWARE_PREEMPTION", "CUDA_ENABLE_COREDUMP_ON_EXCEPTION") \
+                            and env[k]:
+                        yield 0, (pid, name, "debugger setting", "%s=%s" % (k, env[k]))
+            if unchecked:
+                self.log.warning("%d GPU process(es) not checked for an attached debugger: ProcessDebugPort "
+                                 "unreadable (run as Administrator): %s", len(unchecked),
+                                 ", ".join(map(str, unchecked[:20])))
+        return TreeGrid([("PID", int), ("Name", str), ("Indicator", str), ("Details", str)], rows())
+
     def run(self):
+        if self.ctx.live.is_windows:
+            return self._windows(self.ctx.live)
         require_linux(self.ctx.live, self.NAME)
         procs = all_procs(self.ctx)
         gpu = gpu_procs(self.ctx)
@@ -557,12 +927,45 @@ class Profiling(Plugin):
                    "injection, /dev/nvidia-uvm-tools).")
     METHOD = ("Reads RmProfilingAdminOnly from /proc/driver/nvidia/params and NVreg_RestrictProfilingToAdminUsers "
               "from modprobe.d; per process checks mapped libcupti/libnvperf/libnvToolsExt, fds on "
-              "/dev/nvidia-uvm-tools and injection variables.")
+              "/dev/nvidia-uvm-tools and injection variables. On Windows RmProfilingAdminOnly is read from the "
+              "nvlddmkm service keys (Global\\NVTweak, Parameters) and the NVIDIA display-class key, and each GPU "
+              "process's modules (cupti*, nvperf*, nvToolsExt*) and PEB environment are checked.")
     ANALOG = "linux.tracing.perf_events"
     SOURCES = ("live",)
 
+    def _windows(self, src):
+        def rows():
+            found = win_rm_profiling(src)
+            if src.registry_key(NVLDDMKM_KEY) is None:
+                yield 0, ("system", na(""), "registry", "RmProfilingAdminOnly",
+                          na("no NVIDIA display driver (nvlddmkm service) installed"), "unknown")
+            elif not found:
+                yield 0, ("system", na(""), "registry", "RmProfilingAdminOnly",
+                          "not set: the driver default applies (GPU performance counters restricted to "
+                          "administrators since the CVE-2018-6260 fix, R419.67)", "info")
+            for key, v in found:
+                exposed = str(v).strip() == "0"
+                yield 0, ("system", na(""), key, "RmProfilingAdminOnly=%s" % v,
+                          "GPU performance counters usable by non-admin users (side channel, CVE-2018-6260)"
+                          if exposed else "performance counters restricted to administrators",
+                          "high" if exposed else "info")
+            for pid, info in sorted(win_gpu_procs(self.ctx).items()):
+                p = info["proc"]
+                if p is None:
+                    continue
+                name = win_name(p)
+                for dll in win_dlls(info["modules"], WIN_PROFILER_DLLS):
+                    yield 0, ("process", pid, name, "profiling library", dll, "low")
+                env, _why = win_env(src, pid)
+                for k in sorted(env or {}):
+                    if k.upper() in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH") and env[k]:
+                        yield 0, ("process", pid, name, k.upper(), env[k], "high")
+        return TreeGrid(PROFILING_COLUMNS, rows())
+
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
         require_linux(src, self.NAME)
         params = read_params(src)
 
@@ -596,8 +999,11 @@ class Profiling(Plugin):
                 for k in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH"):
                     if (p.get("environ") or {}).get(k):
                         yield 0, ("process", pid, name, k, p["environ"][k], "high")
-        return TreeGrid([("Scope", str), ("PID", int), ("Name/Source", str), ("Indicator", str), ("Details", str),
-                         ("Risk", str)], rows())
+        return TreeGrid(PROFILING_COLUMNS, rows())
+
+
+PROFILING_COLUMNS = [("Scope", str), ("PID", int), ("Name/Source", str), ("Indicator", str), ("Details", str),
+                     ("Risk", str)]
 
 
 CONTAINER_RES = [(re.compile(r"docker[-/]([0-9a-f]{12,64})"), "docker"),
@@ -647,6 +1053,12 @@ class Containers(Plugin):
 
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            raise UnsupportedError(
+                "nvidia.containers inspects Linux cgroups and the NVIDIA Container Toolkit, which do not exist on "
+                "Windows: GPU containers and WSL2 reach the GPU through Hyper-V GPU paravirtualisation, visible on "
+                "the host as vmwp.exe in windows.gpuprocs. Run nvidia.containers inside the Linux guest (WSL2/VM) "
+                "and wsl.dxgprocs on a guest memory image")
         require_linux(src, self.NAME)
 
         def rows():
@@ -699,6 +1111,31 @@ def matches_daemon(p, name) -> bool:
     return p.get("comm") == name[:15] or _exe_base(p) == name or argv0 == name
 
 
+#: install locations of NVIDIA's Windows binaries (driver store, Program Files, System32 copies)
+WIN_NVIDIA_DIRS_RE = re.compile(r"\\program files(?: \(x86\))?\\nvidia corporation\\|"
+                                r"\\system32\\driverstore\\filerepository\\nv[^\\]*\.inf_", re.I)
+WIN_SYSTEM_DIRS_RE = re.compile(r"^[a-z]:\\windows\\(?:system32|syswow64)\\", re.I)
+#: image names of NVIDIA's Windows services and helpers (lower case)
+WIN_NVIDIA_BINARIES = {"nvcontainer.exe", "nvdisplay.container.exe", "nvsphelper64.exe", "nvidia share.exe",
+                       "nvidia overlay.exe", "nvidia app.exe", "nvidia web helper.exe", "nvtelemetrycontainer.exe",
+                       "nvcplui.exe", "nvidia-smi.exe", "nvdebugdump.exe", "nvbackend.exe"}
+START_TYPES = {0: "boot", 1: "system", 2: "automatic", 3: "manual", 4: "disabled"}
+
+
+def win_nvidia_services(src):
+    """``[(service name, values)]`` of NVIDIA services registered under HKLM\\...\\Services: names starting with
+    nv/NVIDIA whose DisplayName or ImagePath names NVIDIA or an NVIDIA install folder."""
+    out = []
+    for name in (src.registry_key(SERVICES_KEY) or {}).get("subkeys", []):
+        if not re.match(r"(?i)^nv|nvidia", name):
+            continue
+        vals = (src.registry_key(SERVICES_KEY + "\\" + name) or {}).get("values") or {}
+        text = " ".join(str(vals.get(k) or "") for k in ("DisplayName", "ImagePath", "Description"))
+        if "nvidia" in text.lower() or WIN_NVIDIA_DIRS_RE.search(str(vals.get("ImagePath") or "")):
+            out.append((name, vals))
+    return out
+
+
 class Daemons(Plugin):
     NAME = "nvidia.daemons"
     CATEGORY = "nvidia.services"
@@ -706,12 +1143,56 @@ class Daemons(Plugin):
                    "dcgm-exporter, gridd): whether each runs, from which executable, and which unit files exist.")
     METHOD = ("Matches /proc/<pid>/{comm,exe,cmdline} against the daemon names, compares the executable with the "
               "packaged path, and looks for unit files in /etc/systemd/system, /lib/systemd/system and "
-              "/usr/lib/systemd/system.")
+              "/usr/lib/systemd/system. On Windows: the user-mode NVIDIA services registered under "
+              "HKLM\\SYSTEM\\CurrentControlSet\\Services (ImagePath, start type, account) matched to running "
+              "processes by image path, plus running NVIDIA binaries that are not a service image; the expected "
+              "location is Program Files\\NVIDIA Corporation, the driver store or System32.")
     ANALOG = "windows.svcscan / windows.svclist"
     SOURCES = ("live",)
 
+    def _windows(self, src):
+        procs = src.win_processes()
+
+        def rows():
+            images = set()
+            for name, vals in win_nvidia_services(src):
+                if not (vals.get("Type") or 0) & 0x30:
+                    continue  # kernel drivers: see nvidia.modules / nvidia.driver
+                image = wgpu.win_path(src, str(vals.get("ImagePath") or ""))
+                images.add(image.lower())
+                reg = "%s\\%s (start %s, account %s)" % (SERVICES_KEY, name,
+                                                         START_TYPES.get(vals.get("Start"), vals.get("Start")),
+                                                         vals.get("ObjectName") or "-")
+                expected = bool(WIN_NVIDIA_DIRS_RE.search(image) or WIN_SYSTEM_DIRS_RE.search(image))
+                running = [p for p in procs if image and (p.get("path") or "").lower() == image.lower()]
+                # a LocalSystem service's image path is not readable without elevation: match it by image name
+                unverified = [p for p in procs if image and not p.get("path") and
+                              win_name(p).lower() == wgpu.basename(image).lower()]
+                images.update("?" + win_name(p).lower() for p in unverified)
+                if not running and not unverified:
+                    yield 0, (name, False, na(""), image or na("no ImagePath"), expected, reg)
+                for p in sorted(running, key=lambda x: x["pid"]):
+                    yield 0, (name, True, p["pid"], p["path"], expected, reg)
+                for p in sorted(unverified, key=lambda x: x["pid"]):
+                    yield 0, (name, True, p["pid"], na("access denied (registered %s)" % image), na("unverified"),
+                              reg)
+            for p in sorted(procs, key=lambda x: x["pid"]):
+                path = p.get("path") or ""
+                if path.lower() in images or (not path and "?" + win_name(p).lower() in images):
+                    continue
+                if WIN_NVIDIA_DIRS_RE.search(path) or (p.get("name") or "").lower() in WIN_NVIDIA_BINARIES:
+                    parent = next((q for q in procs if q["pid"] == p.get("ppid")), None)
+                    yield 0, (win_name(p), True, p["pid"], path or na("access denied"),
+                              bool(WIN_NVIDIA_DIRS_RE.search(path) or WIN_SYSTEM_DIRS_RE.search(path)) if path
+                              else na("unknown"),
+                              "not a service image (parent %s %s)" % (p.get("ppid"), win_name(parent)))
+        return TreeGrid([("Service", str), ("Running", bool), ("PID", int), ("Exe", str), ("Expected path", bool),
+                         ("Registration", str)], rows())
+
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
         require_linux(src, self.NAME)
         procs = all_procs(self.ctx)
 
@@ -735,6 +1216,11 @@ class Daemons(Plugin):
 CACHE_DIRS = [(".nv/ComputeCache", "CUDA JIT ComputeCache", True), (".nv/GLCache", "NVIDIA GL shader cache (legacy)",
               False), (".cache/nvidia/GLCache", "NVIDIA GL/Vulkan shader cache", False),
               (".cache/nvidia/DXCache", "NVIDIA DX shader cache", False)]
+WIN_CACHE_DIRS = [("AppData\\Roaming\\NVIDIA\\ComputeCache", "CUDA JIT ComputeCache", True),
+                  ("AppData\\Local\\NVIDIA\\GLCache", "NVIDIA GL/Vulkan shader cache", False),
+                  ("AppData\\Local\\NVIDIA\\DXCache", "NVIDIA DX shader cache", False)]
+WIN_NON_USER_PROFILES = {"public", "default", "default user", "all users", "desktop.ini"}
+PROFILE_LIST_KEY = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
 
 
 def analyse_blob(data: bytes):
@@ -783,19 +1269,35 @@ class ComputeCache(Plugin, TimeLinerInterface):
                    "(e.g. mining kernels).")
     METHOD = ("Walks ~/.nv/ComputeCache, ~/.nv/GLCache, ~/.cache/nvidia/{GLCache,DXCache} under /root and /home/*; "
               "ComputeCache files are scanned for cubins (EM_CUDA ELF), fatbins (0xBA55ED50) and PTX (.version) "
-              "and kernel names are classified with the miner/cracker indicators.")
+              "and kernel names are classified with the miner/cracker indicators. On Windows the same caches are "
+              "AppData\\Roaming\\NVIDIA\\ComputeCache and AppData\\Local\\NVIDIA\\{GLCache,DXCache} of every "
+              "profile under the ProfileList ProfilesDirectory (C:\\Users); profiles this account cannot read are "
+              "reported as such.")
     ANALOG = "windows.shimcachemem / windows.registry.amcache"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("max_files", int, 500, "maximum cache files to examine"),
                     Requirement("read_bytes", "size", 256 * 1024, "bytes read from each ComputeCache file")]
 
+    def _homes(self, src):
+        """``(home directories, path separator, cache dirs)`` of the analysed system."""
+        if src.is_windows:
+            vals = (src.registry_key(PROFILE_LIST_KEY) or {}).get("values") or {}
+            root = str(vals.get("ProfilesDirectory") or r"C:\Users").rstrip("\\")
+            users = [n for n in (src.listdir(root) or []) if n.lower() not in WIN_NON_USER_PROFILES]
+            return [root + "\\" + n for n in users], "\\", WIN_CACHE_DIRS
+        return ["/root"] + ["/home/" + n for n in (src.listdir("/home") or [])], "/", CACHE_DIRS
+
     def _entries(self):
+        """``(label, path, stat, kinds, kernels)``; stat None: profile unreadable; kinds None: not in snapshot."""
         src = self.ctx.live
-        homes = ["/root"] + ["/home/" + n for n in (src.listdir("/home") or [])]
+        homes, sep, cache_dirs = self._homes(src)
         budget = self.opts["max_files"]
         for home in homes:
-            for rel, label, analyse in CACHE_DIRS:
-                root = home + "/" + rel
+            if sep == "\\" and src.listdir(home) is None:
+                yield "user profile", home, None, [], []
+                continue
+            for rel, label, analyse in cache_dirs:
+                root = home + sep + rel
                 stack = [(root, 0)]
                 while stack and budget > 0:
                     d, depth = stack.pop()
@@ -803,7 +1305,7 @@ class ComputeCache(Plugin, TimeLinerInterface):
                     if names is None:
                         continue
                     for n in names:
-                        path = d + "/" + n
+                        path = d + sep + n
                         st = src.stat(path)
                         if st is None:
                             continue
@@ -814,18 +1316,31 @@ class ComputeCache(Plugin, TimeLinerInterface):
                         budget -= 1
                         kinds, kernels = ([], [])
                         if analyse and st["size"]:
-                            data = src.read_bytes(path, self.opts["read_bytes"]) or b""
-                            kinds, kernels = analyse_blob(data)
+                            try:
+                                data = src.read_bytes(path, self.opts["read_bytes"]) or b""
+                                kinds, kernels = analyse_blob(data)
+                            except NotRecordedError:
+                                kinds = None
                         yield label, path, st, kinds, kernels
                         if budget <= 0:
                             break
 
     def run(self):
-        require_linux(self.ctx.live, self.NAME)
+        src = self.ctx.live
+        if not src.is_windows:
+            require_linux(src, self.NAME)
 
         def rows():
             for label, path, st, kinds, kernels in self._entries():
-                inds = sorted({"%s:%s" % c for k in kernels for c in miners.classify(k)})
+                if st is None:
+                    yield 0, (label, path, na(""), na(""), na("profile not readable by this account (run as "
+                                                              "Administrator)"), na(""), na(""))
+                    continue
+                if kinds is None:
+                    nr = na("not recorded in snapshot (--read-bytes differs from the acquisition)")
+                    yield 0, (label, path, st["size"], utc_from_epoch(st.get("mtime")), nr, nr, nr)
+                    continue
+                inds = sorted({"%s:%s" % c for k in kernels for c in miners.classify(k, context="kernel")})
                 yield 0, (label, path, st["size"], utc_from_epoch(st.get("mtime")), ", ".join(kinds) or "-",
                           ", ".join(kernels) or "-", ", ".join(inds) or "-")
         return TreeGrid([("Cache", str), ("Path", str), ("Size", int), ("Modified", object), ("Content", str),
@@ -833,6 +1348,8 @@ class ComputeCache(Plugin, TimeLinerInterface):
 
     def generate_timeline(self):
         for label, path, st, kinds, kernels in self._entries():
+            if st is None:
+                continue
             yield ("%s entry %s modified%s" % (label, path, (" (kernels: %s)" % ", ".join(kernels)) if kernels else ""),
                    "Modified", utc_from_epoch(st.get("mtime")))
 
@@ -870,7 +1387,10 @@ class Autostart(Plugin):
                    "temporary locations and missing files.")
     METHOD = ("Reads /etc/OpenCL/vendors/*.icd, the Vulkan/EGL JSON manifests (ICD.library_path, layer.library_path), "
               "~/.local/share/vulkan/implicit_layer.d, /etc/ld.so.preload, modprobe.d, udev rules and NVIDIA "
-              "systemd units. Implicit Vulkan layers load into every Vulkan application.")
+              "systemd units. Implicit Vulkan layers load into every Vulkan application. On Windows: "
+              "HKLM/HKLM WOW6432Node/HKCU SOFTWARE\\Khronos\\OpenCL\\Vendors and Khronos\\Vulkan\\{Drivers,"
+              "ImplicitLayers,ExplicitLayers} (each manifest's library_path resolved), and the OpenCL*/Vulkan* "
+              "driver names of every display-class adapter key.")
     ANALOG = "windows.registry.scheduled_tasks / windows.svcscan (persistence)"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("suspicious_only", bool, False, "only suspicious entries")]
@@ -919,11 +1439,62 @@ class Autostart(Plugin):
                         sus, why = path_risk(src, cmd.split()[0] if cmd else "")
                         yield ("systemd", path, cmd, sus, why)
 
+    def _manifest(self, src, kind, manifest, note=""):
+        """Rows for one Vulkan JSON manifest: the manifest itself and the library each entry loads."""
+        msus, mwhy = win_path_risk(src, manifest)
+        text = src.read_text(manifest) if not mwhy.startswith("referenced") else None
+        if text is None:
+            yield (kind, manifest, "(manifest)", msus or True, mwhy or "manifest unreadable")
+            return
+        for name, lib in _json_libraries(text):
+            resolved = lib
+            if lib and ("\\" in lib or "/" in lib) and not ntpath.isabs(lib):
+                resolved = ntpath.normpath(ntpath.join(ntpath.dirname(manifest), lib))
+            lsus, lwhy = win_path_risk(src, resolved)
+            why = "; ".join(w for w in (("manifest: " + mwhy) if mwhy else "", lwhy, note) if w)
+            yield (kind, manifest, "%s %s" % (name, resolved) if name else resolved, msus or lsus, why)
+
+    def _windows_entries(self):
+        src = self.ctx.live
+        for hive, label in (("HKLM\\SOFTWARE", ""), ("HKLM\\SOFTWARE\\WOW6432Node", " (32-bit)"),
+                            ("HKCU\\SOFTWARE", " (user)")):
+            vendors = hive + "\\Khronos\\OpenCL\\Vendors"
+            for dll, state in sorted(((src.registry_key(vendors) or {}).get("values") or {}).items()):
+                sus, why = win_path_risk(src, dll)
+                yield ("opencl-icd" + label, vendors, dll, sus,
+                       "; ".join(w for w in (why, "disabled (value %s)" % state if state else "") if w))
+            for sub, kind in (("Drivers", "vulkan-icd"), ("ImplicitLayers", "vulkan-implicit-layer"),
+                              ("ExplicitLayers", "vulkan-explicit-layer")):
+                key = hive + "\\Khronos\\Vulkan\\" + sub
+                for manifest, state in sorted(((src.registry_key(key) or {}).get("values") or {}).items()):
+                    for row in self._manifest(src, kind + label, manifest,
+                                              "disabled (value %s)" % state if state else ""):
+                        yield row
+        for key, vals in display_adapter_keys(src):
+            for name in sorted(vals):
+                if not name.startswith(("OpenCL", "Vulkan")) or "DriverName" not in name and "Layers" not in name:
+                    continue
+                for path in (vals[name] if isinstance(vals[name], list) else [vals[name]]):
+                    if not isinstance(path, str) or not path:
+                        continue
+                    kind = "display-driver %s (%s)" % (name, vals.get("DriverDesc") or key.rsplit("\\", 1)[-1])
+                    if path.lower().endswith(".json"):
+                        for row in self._manifest(src, kind, path):
+                            yield row
+                    else:
+                        sus, why = win_path_risk(src, path)
+                        yield (kind, key, path, sus, why)
+
     def run(self):
-        require_linux(self.ctx.live, self.NAME)
+        src = self.ctx.live
+        if src.is_windows:
+            entries = self._windows_entries()
+        else:
+            require_linux(src, self.NAME)
+            entries = self._entries()
 
         def rows():
-            for kind, source, entry, sus, why in self._entries():
+            for kind, source, entry, sus, why in entries:
                 if self.opts["suspicious_only"] and not sus:
                     continue
                 yield 0, (kind, source, entry, sus, why)

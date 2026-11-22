@@ -52,7 +52,8 @@ class ImagePluginTests(unittest.TestCase):
         self.assertEqual(LOAD_ERRORS, {})
 
     def test_every_image_plugin_runs_and_renders(self):
-        skip = {"yarascan", "nvidia.vayarascan", "nvidia.bugreport", "nvidia.xid"}
+        skip = {"yarascan", "nvidia.vayarascan", "nvidia.bugreport", "nvidia.xid",
+                "nvidia.malware.hostpages"}  # needs a host kernel image (tested in test_hostmem)
         needs = {"regexscan": {"pattern": "SHARED"}, "nvidia.varegexscan": {"pattern": "SHARED"},
                  "hexdump": {"address": 0x20000}}
         for name, cls in sorted(PLUGINS.items()):
@@ -102,7 +103,9 @@ class ImagePluginTests(unittest.TestCase):
         sizes = {int(va): int(sz) for va, sz in zip(col(g, "VA"), col(g, "Size"))}
         self.assertEqual(sizes[TRUTH["huge_page"]["va"]], 0x200000)
         s = run("nvidia.sysmemmap")
-        self.assertEqual([int(x) for x in col(s, "Host/Peer PA")], [TRUTH["sysmem_mapping"]["host_pa"]])
+        hpo = TRUTH["host_page_owners"]
+        self.assertEqual([int(x) for x in col(s, "Host/Peer PA")],
+                         [TRUTH["sysmem_mapping"]["host_pa"], hpo["victim"]["host_pa"], hpo["kernel_text"]["host_pa"]])
         self.assertTrue(bytes(col(s, "Preview")[0]).startswith(b"HOST-SYSMEM-PAGE"))
 
     def test_pending_work(self):
@@ -134,6 +137,13 @@ class ImagePluginTests(unittest.TestCase):
         self.assertIn("ethash_search, kawpow_hash", col(p, "Entries"))
         imp = run("nvidia.imports")
         self.assertIn("vprintf", col(imp, "Import"))
+
+    def test_fill_regions(self):
+        g = run("nvidia.malware.fillscan")
+        rows = g.as_dicts()
+        self.assertEqual([(int(r["Start"]), r["Size"], r["Pattern"]) for r in rows],
+                         [(TRUTH["fill"]["pa"], TRUTH["fill"]["size"], TRUTH["fill"]["pattern"])])
+        self.assertIn("0x%x" % TRUTH["fill"]["va"], rows[0]["MappedAt"])
 
     def test_malware_findings(self):
         sf = run("nvidia.malware.sassfind")

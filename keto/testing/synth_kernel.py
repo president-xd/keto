@@ -2,8 +2,9 @@
 
 The image is a physical RAM dump with a KASLR-style layout: the kernel image is loaded at a non-zero
 ``phys_base``, objects live in the direct map, and the handle table sits in vmalloc space reachable only
-through ``init_top_pgt`` (4-level walk, with one 2 MiB large page). Decoy ``"Linux version "`` strings
-check that ``phys_base`` is only accepted when the image's own ``phys_base`` variable agrees.
+through ``init_top_pgt`` (4-level walk, with one 2 MiB large page), as does one page in module space above
+``_end``. Decoy ``"Linux version "`` strings check that ``phys_base`` is only accepted when the image's own
+``phys_base`` variable agrees. ``write_kcore`` turns the image into a ``/proc/kcore``-style ELF core.
 
 Scenario:
   * task 100 "cudaapp" holds /dev/dxg (fd 3) -> dxgprocess A (vpid 7 in a child PID namespace) with one
@@ -12,6 +13,7 @@ Scenario:
   * dxgprocess X (tgid 400) has no task: exited or hidden from the task list
   * task 300 "hider" holds /dev/dxg (fd 4) whose private_data is a dxgprocess not on dxgglobal.plisthead
   * task 200 "bash" uses no GPU
+  * task 100 is PID 7 in that child namespace (``thread_pid->numbers[1]``); tasks 200 and 300 are in the initial one
 """
 
 from __future__ import annotations
@@ -29,8 +31,11 @@ PHYS_BASE = 0x200000
 POB = 0xFFFF888000000000                  # page_offset_base
 VMALLOC_VA = 0xFFFFC90000010000           # handle table (4 KiB pages)
 VMALLOC_LARGE_VA = 0xFFFFC90000400000     # 2 MiB large page
+MODULE_VA = 0xFFFFFFFFC0001000            # module space: above _end, reachable only through the page tables
+MODULE_PA = 0x1F80000
 VMEMMAP = 0xFFFFEA0000000000
 NS_INUM = 4026532252
+PT_POOL = 0x1D00000                      # user page-table pages
 
 
 def build_btf() -> Tuple[bytes, Dict[str, int]]:
@@ -73,11 +78,14 @@ def build_btf() -> Tuple[bytes, Dict[str, int]]:
     nsc = b.struct("ns_common", 8, [("inum", u32, 0)])
     b.struct("pid_namespace", 16, [("level", u32, 0), ("ns", nsc, 8)])
     b.struct("task_struct", 64, [("tasks", lh, 0), ("pid", i32, 16), ("tgid", i32, 20), ("comm", comm, 24),
-                                 ("files", vp, 40), ("mm", vp, 48)])
+                                 ("files", vp, 40), ("mm", vp, 48), ("thread_pid", vp, 56)])
+    upid = b.struct("upid", 16, [("nr", i32, 0), ("ns", vp, 8)])
+    b.struct("pid", 8, [("count", u32, 0), ("level", u32, 4), ("numbers", b.array(upid, 0, u32), 8)])  # numbers[]
     b.struct("files_struct", 16, [("fdt", vp, 0)])
     b.struct("fdtable", 16, [("max_fds", u32, 0), ("fd", vp, 8)])
     b.struct("file", 32, [("f_op", vp, 0), ("private_data", vp, 8)])
     b.struct("page", 64, [("flags", u64, 0)])
+    b.struct("mm_struct", 16, [("pgd", vp, 0), ("map_count", u32, 8)])
     return b.build(), {}
 
 
@@ -115,7 +123,7 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
     syms = {"_text": TEXT_VA, "linux_banner": TEXT_VA + 0x1000, "phys_base": TEXT_VA + 0x2000,
             "page_offset_base": TEXT_VA + 0x2008, "vmemmap_base": TEXT_VA + 0x2010,
             "__pgtable_l5_enabled": TEXT_VA + 0x2018, "init_task": TEXT_VA + 0x3000, "init_top_pgt": TEXT_VA + 0x10000,
-            "dxgdrv": TEXT_VA + 0x4000, "dxgk_fops": TEXT_VA + 0x5000}
+            "dxgdrv": TEXT_VA + 0x4000, "dxgk_fops": TEXT_VA + 0x5000, "_end": TEXT_VA + 0x20000}
     banner = b"Linux version 6.18.0-synthetic (keto@test) #1 SMP"
     m.put(text_pa(syms["linux_banner"]), banner + b"\x00")
     m.put(0x1100000, b"Linux version decoy-before-kernel\x00")        # decoys: phys_base check must reject them
@@ -150,6 +158,12 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
     large_pa = 0x1A00000
     m.q(pd + ((VMALLOC_LARGE_VA >> 21) & 0x1FF) * 8, large_pa | 0xE3)         # PS: 2 MiB page
     m.put(large_pa + 0x1234, b"LARGE-PAGE-MARKER")
+    mpdpt, mpd, mpt = pgd + 0x4000, pgd + 0x5000, pgd + 0x6000                # module page (still below _end)
+    m.q(pgd + ((MODULE_VA >> 39) & 0x1FF) * 8, mpdpt | 0x63)
+    m.q(mpdpt + ((MODULE_VA >> 30) & 0x1FF) * 8, mpd | 0x63)
+    m.q(mpd + ((MODULE_VA >> 21) & 0x1FF) * 8, mpt | 0x63)
+    m.q(mpt + ((MODULE_VA >> 12) & 0x1FF) * 8, MODULE_PA | 0x8000000000000063)
+    m.put(MODULE_PA, b"MODULE-PAGE-MARKER")
 
     # -- dxgglobal ---------------------------------------------------------------------------------------
     g = m.alloc(48)
@@ -212,7 +226,7 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
         list_add(dev + 32, a)
         m.d(a + 16, handle)
         m.d(a + 20, npages)
-        m.q(a + 24, 0x7F0000000000 + handle)
+        m.q(a + 24, 0x7F0000000000 + (handle & 0xFFF) * 0x100000)  # page-aligned CPU VA
         m.q(a + 32, pages_ptr)
         m.buf[a + 40] = flags
         allocs.append(a)
@@ -254,7 +268,33 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
             m.q(arr + fd * 8, va(f))
         return va(fs)
 
-    tasks = {}
+    # -- user page tables (4-level) for G4 page ownership: page pool at PT_POOL ----------------------------
+    pool = [PT_POOL]
+
+    def new_page():
+        pa = pool[0]
+        pool[0] += 0x1000
+        return pa
+
+    def map_user(pgd, uva, pa, rw=True):
+        table = pgd
+        for sh in (39, 30, 21):
+            slot = table + ((uva >> sh) & 0x1FF) * 8
+            e = struct.unpack_from("<Q", m.buf, slot)[0]
+            if not e & 1:
+                e = new_page() | 0x67
+                m.q(slot, e)
+            table = e & 0x000FFFFFFFFFF000
+        m.q(table + ((uva >> 12) & 0x1FF) * 8, pa | 0x65 | (0x2 if rw else 0) | (1 << 63))
+
+    victim_pa = 0x1E00000
+    m.put(victim_pa, b"keyboard ring buffer: user typed secrets here")
+    cpu_va = 0x7F0000000000 + 0x100 * 0x100000
+    user_maps = {100: [(cpu_va, gpages[0]), (cpu_va + 0x1000, gpages[1]), (0x400000, 0x1E40000)],
+                 200: [(0x7FFE00000000, victim_pa)],
+                 300: [(0x7FAA00000000, gpages[1])]}  # hider maps a page of A's GPU allocation
+    tasks, mms = {}, {}
+    nspids = {100: 7, 200: 200, 300: 300}  # cudaapp runs in the child PID namespace of dxgprocess A
     for pid, comm, fds in ((100, b"cudaapp", {3: proc_a}), (200, b"bash", {}), (300, b"hider", {4: proc_u})):
         t = m.alloc(64)
         list_add(init_pa, t)
@@ -262,8 +302,21 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
         m.d(t + 20, pid)
         m.put(t + 24, comm)
         m.q(t + 40, files_with(fds))
-        m.q(t + 48, 0xFFFF888000ABC000)
+        numbers = [(pid, 0)] + ([(nspids[pid], va(ns))] if nspids[pid] != pid else [])
+        sp = m.alloc(8 + 16 * len(numbers), 8)  # struct pid with numbers[level + 1]
+        m.d(sp + 4, len(numbers) - 1)
+        for i, (nr, ns_va) in enumerate(numbers):
+            m.d(sp + 8 + 16 * i, nr)
+            m.q(sp + 16 + 16 * i, ns_va)
+        m.q(t + 56, va(sp))
+        mm = m.alloc(16)
+        pgd = new_page()
+        m.q(mm, va(pgd))
+        for uva, upa in user_maps[pid]:
+            map_user(pgd, uva, upa)
+        m.q(t + 48, va(mm))
         tasks[pid] = va(t)
+        mms[pid] = pgd
 
     kallsyms = "".join("%016x T %s\n" % (v, k) for k, v in sorted(syms.items(), key=lambda kv: kv[1]))
     truth = {"phys_base": PHYS_BASE, "page_offset_base": POB, "banner": banner.decode(),
@@ -277,5 +330,30 @@ def build_image() -> Tuple[bytes, bytes, str, dict]:
              "pidns": NS_INUM, "adapter": "NVIDIA GeForce RTX 4050 Laptop GPU",
              "guest_page_alloc": {"handle": 0x40000100, "kernel": "ethash_search", "cubin": cub[:0x2000]},
              "vmalloc": {"va": VMALLOC_VA, "pa": table_pa}, "large_page": {"va": VMALLOC_LARGE_VA, "pa": large_pa},
-             "tasks": tasks}
+             "module_page": {"va": MODULE_VA, "pa": MODULE_PA},
+             "kernel_image": (text_pa(syms["_text"]), text_pa(syms["_end"])),
+             "tasks": tasks, "nspids": nspids,
+             "page_owners": {"victim_pa": victim_pa, "victim_owner": 200, "kernel_text_pa": text_pa(TEXT_VA + 0x1000),
+                             "guest_pages": gpages, "foreign": {gpages[1]: 300}, "cpu_va": cpu_va}}
     return bytes(m.buf), btf_blob, kallsyms, truth
+
+
+def write_kcore(path: str, image: bytes, truth: dict,
+                ram: Tuple[Tuple[int, int], ...] = ((0x1000, 0x9F000), (0x100000, PHYS_SIZE - 0x100000))) -> None:
+    """Write ``image`` as a ``/proc/kcore``-style ELF core, laid out as ``fs/proc/kcore.c`` does: one PT_LOAD per
+    RAM range in the direct map (``p_vaddr = page_offset_base + p_paddr``), the kernel text ``_text`` .. ``_end``
+    (``p_paddr = __pa_symbol(_text)``) and the vmalloc and module pages (``p_paddr = -1``)."""
+    ki = truth["kernel_image"]
+    segs = [(POB + start, start, image[start:start + size]) for start, size in ram]
+    segs.append((TEXT_VA, ki[0], image[ki[0]:ki[1]]))
+    for va, pa in ((truth["vmalloc"]["va"], truth["vmalloc"]["pa"]), (MODULE_VA, MODULE_PA)):
+        segs.append((va, 0xFFFFFFFFFFFFFFFF, image[pa:pa + 0x1000]))
+    off = 64 + 56 * len(segs)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01", 4, 62, 1, 0, 64, 0, 0, 64, 56,
+                             len(segs), 0, 0, 0))
+        for va, pa, data in segs:
+            fh.write(struct.pack("<IIQQQQQQ", 1, 7, off, va, pa, len(data), len(data), 0x1000))
+            off += len(data)
+        for _va, _pa, data in segs:
+            fh.write(data)

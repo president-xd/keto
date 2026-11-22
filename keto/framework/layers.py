@@ -136,6 +136,18 @@ class DataLayer:
                 yield pos, self._read_run(pos, take), payload
                 pos += payload
 
+    def regions(self):
+        """``[(layer offset, buffer, buffer start, length)]`` covering the whole layer with buffers that support
+        ``find(sub, start, end)`` and ``re`` with bounds (an mmap or bytes), so scanners can search in place; None
+        when the layer cannot provide them (then scanners read chunks)."""
+        return None
+
+    def iter_views(self, chunk_size: int = CHUNK_SIZE) -> Iterator[Tuple[int, object]]:
+        """Yield ``(offset, buffer)`` over every readable run without overlap. File-backed layers yield zero-copy
+        ``memoryview`` slices of the file mapping (the caller must not keep them); others yield bytes."""
+        for off, data, _payload in self.iter_chunks(chunk_size, 0):
+            yield off, data
+
     def describe(self) -> str:
         return "%s (%s, %d run(s), %d bytes)" % (self.name, self.KIND, len(self.ranges()), self.size)
 
@@ -166,9 +178,49 @@ class FileLayer(DataLayer):
         """The underlying mmap (supports the buffer protocol, usable with ``re``)."""
         return self._mm
 
+    def regions(self):
+        if self._mm is None:
+            return []
+        return [(0, self._mm, self.base_offset, self.length)]
+
+    def region_specs(self):
+        """Like ``regions`` but naming the file, for worker processes that map it themselves."""
+        return [(0, self.path, self.base_offset, self.length)] if self._mm is not None else []
+
+    def view(self, offset: int, length: int):
+        """Zero-copy view of ``[offset, offset+length)``; release it before closing the layer."""
+        o = self.base_offset + offset
+        return memoryview(self._mm)[o:o + length]
+
+    def iter_views(self, chunk_size: int = CHUNK_SIZE):
+        if self._mm is None:
+            return
+        whole = memoryview(self._mm)
+        try:
+            pos = 0
+            while pos < self.length:
+                n = min(chunk_size, self.length - pos)
+                o = self.base_offset + pos
+                v = whole[o:o + n]
+                try:
+                    yield pos, v
+                finally:
+                    v.release()
+                pos += n
+        finally:
+            whole.release()
+
     def close(self):
         if self._mm is not None and not self._mm.closed:
-            self._mm.close()
+            try:
+                self._mm.close()
+            except BufferError:  # a finished regex iterator still holds the buffer: collect it, then close
+                import gc
+                gc.collect()
+                try:
+                    self._mm.close()
+                except BufferError:
+                    pass
         self._fh.close()
 
 
@@ -189,6 +241,9 @@ class BytesLayer(DataLayer):
     def _read_run(self, offset, length):
         o = offset - self.base
         return self.data[o:o + length]
+
+    def regions(self):
+        return [(self.base, self.data, 0, len(self.data))] if self.data else []
 
 
 class SegmentedLayer(DataLayer):
@@ -225,6 +280,50 @@ class SegmentedLayer(DataLayer):
             pos += take
             i += 1
         return bytes(out)
+
+    def regions(self):
+        """Segments backed by file mappings, merged where both the address and the file offset continue; None if
+        a match could straddle two address-adjacent segments stored apart in the file (chunked scanning then)."""
+        out = []
+        for addr, slen, base, boff in self.segments:
+            if not isinstance(base, FileLayer) or base._mm is None:
+                return None
+            fstart = base.base_offset + boff
+            if out and out[-1][0] + out[-1][3] == addr:
+                if out[-1][1] is base._mm and out[-1][2] + out[-1][3] == fstart:
+                    out[-1] = (out[-1][0], out[-1][1], out[-1][2], out[-1][3] + slen)
+                    continue
+                return None
+            out.append((addr, base._mm, fstart, slen))
+        return out
+
+    def region_specs(self):
+        regs = self.regions()
+        if regs is None:
+            return None
+        paths = {id(base._mm): base.path for _a, _l, base, _o in self.segments if isinstance(base, FileLayer)}
+        return [(loff, paths[id(buf)], fstart, length) for loff, buf, fstart, length in regs]
+
+    def iter_views(self, chunk_size: int = CHUNK_SIZE):
+        """Per segment: zero-copy views when the segment's base is a file mapping, bytes otherwise. A chunk never
+        spans two segments (callers that need contiguity across segments use ``iter_chunks``)."""
+        for addr, slen, base, boff in self.segments:
+            if isinstance(base, FileLayer) and base._mm is not None:
+                pos = 0
+                while pos < slen:
+                    n = min(chunk_size, slen - pos)
+                    v = base.view(boff + pos, n)
+                    try:
+                        yield addr + pos, v
+                    finally:
+                        v.release()
+                    pos += n
+            else:
+                pos = 0
+                while pos < slen:
+                    n = min(chunk_size, slen - pos)
+                    yield addr + pos, base.read(boff + pos, n, pad=True)
+                    pos += n
 
     def translate(self, offset: int) -> Optional[Tuple[DataLayer, int]]:
         i = bisect.bisect_right(self._seg_starts, offset) - 1

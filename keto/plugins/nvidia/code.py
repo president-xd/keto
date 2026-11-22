@@ -26,7 +26,9 @@ class CubinScan(Plugin):
     METHOD = ("Scans for the ELF64 magic, keeps EM_CUDA images, sizes them from section/program headers, and "
               "parses SM architecture (e_flags; ABI v7 bits 7:0, ABI v8 bits 15:8), toolkit version "
               "(.note.nv.cuinfo) and kernels (.text.<name> STT_FUNC symbols). Fatbin ELF entries are "
-              "decompressed first (LZ4, zstd or deflate, per the entry flags).")
+              "decompressed first (LZ4, zstd or deflate, per the entry flags; entries that cannot be decoded are "
+              "listed as undecodable), and cubins inside raw zstd frames (driver binaries) are found too when a zstd "
+              "back-end is installed (frames up to 16 MiB compressed / 64 MiB decompressed).")
     ANALOG = "windows.modscan"
 
     def run(self):
@@ -35,7 +37,7 @@ class CubinScan(Plugin):
                 c = fc.cubin
                 if c is None:
                     yield 0, (fc.layer, Address(fc.offset), fc.size, fc.source, na(""), na(""), na(""), 0,
-                              "parse error: %s" % fc.error)
+                              "undecodable: %s" % fc.error)
                     continue
                 yield 0, (fc.layer, Address(fc.offset), fc.size, fc.source, c.arch,
                           "sm_%d" % c.virtual_sm if c.virtual_sm else na("unknown"), c.toolkit_version or na("unknown"),
@@ -50,7 +52,8 @@ class FatbinScan(Plugin):
     DESCRIPTION = ("Finds CUDA fat binaries (the containers nvcc embeds in host programs) and their PTX/ELF "
                    "entries, plus __nv_fatbinwrap descriptors (host-side pointers to fatbins).")
     METHOD = ("Scans for the fatbin header magic 0xBA55ED50, walks the 64-byte entry headers (kind, arch, size, "
-              "flags), LZ4-decompresses entries flagged 0x2000, and scans for wrapper magic 0x466243B1.")
+              "flags), decompresses LZ4 (0x2000), zstd (0x8000) and deflate (0x1000) entries up to their declared "
+              "size, reports entries that cannot be decoded, and scans for wrapper magic 0x466243B1.")
     ANALOG = "windows.unloadedmodules (container view of loadable code)"
 
     def run(self):
@@ -59,7 +62,8 @@ class FatbinScan(Plugin):
                 f = fb["fatbin"]
                 yield 0, (fb["layer"], Address(fb["offset"]), "fatbin", f.total_size, na(""), na(""), "%d entries" % len(f.entries))
                 for e in f.entries:
-                    status = e.error or ("ok, %d bytes" % len(e.data or b""))
+                    data = e.data  # decompresses; sets e.error when that fails
+                    status = ("undecodable: %s" % (e.error or "no data")) if data is None else "ok, %d bytes" % len(data)
                     yield 1, (fb["layer"], Address(e.offset), e.kind_name, e.size, "sm_%d" % e.arch,
                               e.compression or "none", status)
             for w in discovery.fatbin_wrappers(self.ctx):
@@ -75,7 +79,8 @@ class PtxScan(Plugin):
     DESCRIPTION = ("Finds PTX source modules (NVIDIA's virtual ISA, JIT-compiled by the driver) and lists their "
                    "target, entry points, external functions and generator.")
     METHOD = ("Regex-scans for '.version X.Y', carves the surrounding printable text, and parses .target, "
-              ".address_size, .entry/.func/.extern/.global directives; PTX entries of fat binaries are included.")
+              ".address_size, .entry/.func/.extern/.global directives; PTX entries of fat binaries are included "
+              "once (from the fatbin, decompressed when needed), not again from the scan.")
     ANALOG = "windows.filescan (recover code 'files' from memory)"
 
     def run(self):
@@ -195,8 +200,8 @@ class CubinDump(Plugin):
     NAME = "nvidia.cubindump"
     CATEGORY = "nvidia.code"
     DESCRIPTION = "Extracts cubins, decompressed fatbin entries and PTX modules to files (for cuobjdump/nvdisasm)."
-    METHOD = ("Writes each carved object exactly as found (fatbin entries decompressed) and records size and "
-              "SHA-256; file names encode layer, offset and kind.")
+    METHOD = ("Writes each carved object exactly as found (fatbin entries and zstd-frame cubins decompressed) and "
+              "records size and SHA-256; file names encode layer, offset and kind.")
     ANALOG = "windows.pedump / linux.elfs --dump"
     REQUIREMENTS = [Requirement("offset", "address", None, "only the object at this offset")]
 
@@ -209,21 +214,22 @@ class CubinDump(Plugin):
 
         def rows():
             off = self.opts["offset"]
+            used = {}
             for fc in discovery.cubins(self.ctx):
                 if off is not None and fc.offset != off or fc.source == "reference":
                     continue
                 layer = self.ctx.layers.get(fc.layer)
                 data = None
-                if fc.source.startswith("fatbin"):
-                    for fb in discovery.fatbins(self.ctx):
-                        for e in fb["fatbin"].entries:
-                            if e.offset == fc.offset:
-                                data = e.data
+                if fc.blob is not None:  # decompressed (fatbin entry, zstd frame)
+                    data = fc.blob
                 elif layer is not None:
                     data = layer.read(fc.offset, fc.size, pad=True)
                 if not data:
                     continue
-                p = write("cubin_%s_%x.cubin" % (fc.layer, fc.offset), data)
+                name = "cubin_%s_%x" % (fc.layer, fc.offset)
+                n = used.get(name, 0)  # several cubins can come out of one zstd frame
+                used[name] = n + 1
+                p = write("%s%s.cubin" % (name, "_%d" % n if n else ""), data)
                 yield 0, ("cubin", Address(fc.offset), len(data), hashlib.sha256(data).hexdigest(), p)
             for pm in discovery.ptx_modules(self.ctx):
                 if off is not None and pm["offset"] != off:

@@ -1,4 +1,4 @@
-"""Synthetic NVIDIA VRAM images (any generation, Kepler..Blackwell) with ground-truth manifests.
+"""Synthetic NVIDIA VRAM images (any generation, Kepler..Rubin) with ground-truth manifests.
 
 Everything is built with the same encoders the analysis code decodes with
 (``gmmu.encode_*``, ``ramin.encode_*``, ``runlist.encode_*``, ``pushbuf``,
@@ -45,11 +45,14 @@ K4, K64, M2 = 0x1000, 0x10000, 0x200000
 
 SUBCH_COMPUTE, SUBCH_COPY = 1, 4
 SYSMEM_TARGET = 0x123456000
-GENERATIONS = ("kepler", "maxwell", "pascal", "volta", "turing", "ampere", "ada", "hopper", "blackwell")
+HOST_VICTIM_PA, HOST_KTEXT_PA = 0x1E00000, 0x1201000  # bash's buffer / kernel text in synth_kernel's layout
+GENERATIONS = ("kepler", "maxwell", "pascal", "volta", "turing", "ampere", "ada", "hopper", "blackwell", "rubin")
+#: generations whose structures are identical, so only metadata (chipset, NVML id) tells them apart
+STRUCTURAL_TWIN = {"rubin": "blackwell"}
 #: QMD version the driver writes for each generation's compute class (NVIDIA_COMMAND_FACTS.md section 1.2)
 GENERATION_QMD = {"kepler": "v00_06", "maxwell": "v01_07", "pascal": "v02_01", "volta": "v02_02",
                   "turing": "v02_02", "ampere": "v03_00", "ada": "v03_00", "hopper": "v04_00",
-                  "blackwell": "v05_00"}
+                  "blackwell": "v05_00", "rubin": "v05_00"}  # rubin: assumed equal to Blackwell (its profile does)
 #: a representative chipset per generation for snapshot metadata (profile auto-detection)
 GENERATION_CHIP = {"kepler": ("0x0e4", "3.0", 2, "NVIDIA GeForce GTX 680"),
                    "maxwell": ("0x124", "5.2", 3, "NVIDIA GeForce GTX 980"),
@@ -59,7 +62,8 @@ GENERATION_CHIP = {"kepler": ("0x0e4", "3.0", 2, "NVIDIA GeForce GTX 680"),
                    "ampere": ("0x172", "8.6", 7, "NVIDIA GeForce RTX 3080"),
                    "ada": ("0x197", "8.9", 8, "NVIDIA GeForce RTX 4050 Laptop GPU"),
                    "hopper": ("0x180", "9.0", 9, "NVIDIA H100 PCIe"),
-                   "blackwell": ("0x1a0", "10.0", 10, "NVIDIA B200")}
+                   "blackwell": ("0x1a0", "10.0", 10, "NVIDIA B200"),
+                   "rubin": ("0x1c0", None, 13, "NVIDIA Rubin")}  # derived chip id, no published compute capability
 #: PTIMER holds Unix-epoch nanoseconds on current drivers; the synthetic timeline starts here
 T0_NS = int(datetime.datetime(2026, 11, 17, 3, 0, tzinfo=datetime.timezone.utc).timestamp()) * 10 ** 9
 
@@ -359,6 +363,9 @@ def build_image(real_cubin: Optional[bytes] = None, gen: str = "ada") -> Tuple[b
     as2.map(pb_c, 0xA10000, K64, page=K64)
     as2.map(0x1_0010_0000, 0x900000, K4)                               # shared page
     as2.map(0x6_0000_0000, SYSMEM_TARGET, K4, aperture=SYS_COH)       # host memory mapping
+    # host pages of the synthetic kernel image (keto.testing.synth_kernel): another process's buffer and kernel text
+    as2.map(0x6_0001_0000, HOST_VICTIM_PA, K4, aperture=SYS_COH)
+    as2.map(0x6_0002_0000, HOST_KTEXT_PA, K4, aperture=SYS_COH, readonly=True)
     as2.map(0x8_0000_0000, 0x1000000, 0x20000, page=K64)              # pitch surface
     as2.map(0x8_0010_0000, 0x1100000, K64, page=K64, kind=0xFE)       # block-linear surface
     as2.map(0x7_0000_0000, as2.pdb, K4)                                # AS2 maps its own page directory
@@ -367,9 +374,12 @@ def build_image(real_cubin: Optional[bytes] = None, gen: str = "ada") -> Tuple[b
     truth["address_spaces"] = {"AS1": as1.pdb, "AS2": as2.pdb, "AS3": as3.pdb}
     truth["shared_page"] = {"pa": 0x900000, "vas": {"AS1": 0x9_0000_0000, "AS2": 0x1_0010_0000}}
     truth["sysmem_mapping"] = {"as": "AS2", "va": 0x6_0000_0000, "host_pa": SYSMEM_TARGET}
+    truth["host_page_owners"] = {"victim": {"va": 0x6_0001_0000, "host_pa": HOST_VICTIM_PA, "owner_pid": 200},
+                                 "kernel_text": {"va": 0x6_0002_0000, "host_pa": HOST_KTEXT_PA}}
     truth["privileged_user_mapping"] = {"as": "AS1", "va": 0x7_0000_0000}
     truth["page_table_self_map"] = {"as": "AS2", "va": 0x7_0000_0000, "pa": as2.pdb}
     truth["huge_page"] = {"as": "AS1", "va": 0x4_0000_0000, "pa": 0xC00000, "size": M2} if fmt != "v1" else None
+    as1.map(0xA_0000_0000, 0x3800000, M2, page=M2)                    # scraper marker fill (see below)
 
     # ---------------------------------------------------------------- data
     tensor = b"".join(struct.pack("<f", math.sin(i / 50.0)) for i in range(M2 // 4))
@@ -384,9 +394,12 @@ def build_image(real_cubin: Optional[bytes] = None, gen: str = "ada") -> Tuple[b
     surf3 = bytearray(_surface_pixels(w3, h3, 40))
     surf3[3::4] = bytes(len(surf3) // 4)
     img.put(0x1200000, bytes(surf3))
+    w4, h4 = 1000, 128  # row width that is not a multiple of 16 (found by autocorrelation)
+    img.put(0x1300000, _surface_pixels(w4, h4, 70))
     truth["surfaces"] = [{"pa": 0x1000000, "width": w1, "height": h1, "layout": "pitch"},
                          {"pa": 0x1100000, "width": w2, "height": h2, "layout": "blocklinear", "block_height": bh},
-                         {"pa": 0x1200000, "width": w3, "height": h3, "layout": "pitch", "alpha": 0}]
+                         {"pa": 0x1200000, "width": w3, "height": h3, "layout": "pitch", "alpha": 0},
+                         {"pa": 0x1300000, "width": w4, "height": h4, "layout": "pitch"}]
     img.put(0x900000, b"SHARED-PAGE: model weights shard 7 / tenant=alpha" + b"\x5a" * 64)
 
     # ---------------------------------------------------------------- QMDs
@@ -559,6 +572,9 @@ def build_image(real_cubin: Optional[bytes] = None, gen: str = "ada") -> Tuple[b
     rnd = random.Random(99)
     img.put(0x1E00000, bytes(rnd.getrandbits(8) for _ in range(K64)))
     truth["noise"] = {"pa": 0x1E00000, "size": K64}
+    # a remanence scraper's marker: 2 MiB of 0xFF written into its own allocation
+    img.put(0x3800000, bytes([0xFF]) * M2)
+    truth["fill"] = {"pa": 0x3800000, "size": M2, "pattern": "ff", "va": 0xA_0000_0000}
     return bytes(img.buf), truth
 
 

@@ -31,6 +31,7 @@ ATTACK = {
     "T1070.004": "Indicator Removal: File Deletion",
     "T1113": "Screen Capture",
     "T1496": "Resource Hijacking",
+    "T1542.002": "Pre-OS Boot: Component Firmware",
     "T1547.006": "Boot or Logon Autostart Execution: Kernel Modules and Extensions",
     "T1552": "Unsecured Credentials",
     "T1552.004": "Unsecured Credentials: Private Keys",
@@ -60,6 +61,17 @@ class Rule:
         return self.severity(row) if callable(self.severity) else self.severity
 
 
+def _vbios_severity(finding: str) -> str:
+    """nvidia.vbios ``Finding`` is a '; '-joined list: a known-good mismatch is high; structural anomalies
+    (vendor mismatch, bad checksum, broken chain, BIT) medium; trailing data / device-id mismatch low."""
+    parts = [p.strip() for p in finding.split(";") if p.strip()]
+    if any(p.startswith("known-good:") for p in parts):
+        return "high"
+    if any(p.startswith(("vendor mismatch", "checksum BAD", "chain:", "BIT:")) for p in parts):
+        return "medium"
+    return "low"
+
+
 def _txt(row, *cols):
     return " ".join(str(row.get(c) or "") for c in cols)
 
@@ -83,7 +95,17 @@ RULES = [
          "medium", when=lambda r: r.get("Runlist") is False),
     Rule("nvidia.malware.exfil", "GPU DMA moving data out of VRAM", ["T1005"],
          lambda r: "high" if "host RAM" in str(r.get("Why")) or "window" in str(r.get("Why")) else "low"),
-    Rule("nvidia.malware.miner", "Cryptomining / password-cracking GPU workload", ["T1496"], "high"),
+    # a generic hash primitive in a GPU kernel name (blake3, argon2...) is only a weak hint; mining algorithms,
+    # miner software and pool strings are strong evidence
+    Rule("nvidia.malware.miner", "Cryptomining / password-cracking GPU workload", ["T1496"],
+         lambda r: "low" if r.get("Category") == "hash-primitive" else "high"),
+    Rule("nvidia.orphanchans", "GPU channel whose own structures do not resolve (stale, corrupted or forged)",
+         ["T1564"], "medium"),
+    Rule("nvidia.vbios", "GPU option ROM / VBIOS anomaly (firmware implant indicator)", ["T1542.002"],
+         lambda r: _vbios_severity(str(r.get("Finding") or "")),
+         when=lambda r: str(r.get("Finding") or "none") != "none",
+         recommendation="Compare the ROM with the vendor's image for this board (nvidia.vbios --known-good) and "
+                        "re-flash from a trusted source if it differs."),
     Rule("nvidia.secrets", "Credential material present in GPU memory", ["T1552"], "medium",
          recommendation="Rotate the exposed credentials; GPU memory is not cleared by most host tools."),
     Rule("nvidia.aeskeys", "AES key schedule present in GPU memory", ["T1552.004"], "medium"),
@@ -129,12 +151,21 @@ RULES = [
     Rule("nvidia.malware.watchdog", "GPU watchdog weakened (unlimited GPU execution)", ["T1562.001", "T1496"],
          lambda r: "medium" if str(r.get("Finding", "")).startswith("RM registry") else "high",
          when=lambda r: isinstance(r.get("Finding"), str) and bool(r.get("Finding"))),
+    Rule("nvidia.envscan", "GPU injection or loader variable in memory", ["T1574"], "medium", sev_col="Severity",
+         when=lambda r: r.get("Severity") in ("high", "medium")),
+    Rule("nvidia.malware.hostpages", "GPU can access kernel or foreign host pages", ["T1068", "T1005"], "medium",
+         sev_col="Severity", when=lambda r: r.get("Severity") in ("high", "medium")),
+    Rule("nvidia.malware.scraper", "Process holding most of a GPU's memory (remanence scraping / squatting)",
+         ["T1005", "T1496"], "medium", sev_col="Severity"),
+    Rule("nvidia.malware.fillscan", "Large uniform marker fill in VRAM (remanence scraping)", ["T1005"], "medium"),
     Rule("windows.gpuprocs", "GPU use that does not fit the process (loader, windowless compute, miner)",
          ["T1027", "T1496"], "medium", sev_col="Severity", when=lambda r: r.get("Severity") in ("high", "medium")),
     # ---- host kernel memory (Linux / WSL2 RAM image or /proc/kcore)
     Rule("wsl.dxgprocs", "GPU process hidden from the task list or unlinked from the GPU driver", ["T1564", "T1014"],
          "high", when=lambda r: "hidden" in str(r.get("Attention")) or "unlinked" in str(r.get("Attention")),
          evidence="kernel"),
+    Rule("wsl.dxgpageowners", "GPU-shared guest pages owned by another process or the kernel", ["T1055", "T1005"],
+         "high", sev_col="Severity", when=lambda r: r.get("Severity") == "high", evidence="kernel"),
     Rule("wsl.dxgallocs", "GPU payload in guest pages shared with the GPU", ["T1620", "T1027"], "high",
          when=lambda r: isinstance(r.get("Artefacts"), str) and bool(r.get("Artefacts")), evidence="kernel"),
 ]
@@ -146,7 +177,7 @@ RULES = [
 EVIDENCE = {name: "vram" for name in (
     "nvidia.malware.malfind", "nvidia.malware.suspiciouslaunch", "nvidia.malware.sassfind", "nvidia.malware.hostcode",
     "nvidia.malware.codeintegrity", "nvidia.malware.cubinxview", "nvidia.malware.ptcheck", "nvidia.malware.chanxview",
-    "nvidia.malware.exfil", "nvidia.secrets", "nvidia.aeskeys", "nvidia.timeslices")}
+    "nvidia.malware.exfil", "nvidia.secrets", "nvidia.aeskeys", "nvidia.timeslices", "nvidia.malware.fillscan", "nvidia.malware.hostpages")}
 EVIDENCE["nvidia.artifactscan"] = "host"
 for _r in RULES:
     _r.evidence = EVIDENCE.get(_r.plugin, _r.evidence)
@@ -224,11 +255,25 @@ def build(ctx, baseline: Optional[str] = None, include_live: bool = True) -> dic
             case["profile"] = "%s (%s)" % (ctx.profile.name, ctx.profile_reason)
         except Exception:
             pass
+    integrity = "not checked (evidence is not a .keto container)"
     if ctx.container is not None:
-        case["integrity"] = [{"segment": r["segment"], "space": r["space"], "ok": r["ok"]} for r in ctx.container.verify()]
+        rows = ctx.container.verify()
+        case["integrity"] = [{"segment": r["segment"], "space": r["space"], "ok": r["ok"],
+                              "detail": r.get("detail", "")} for r in rows]
+        case["fingerprint"] = ctx.container.fingerprint
+        failed = [r for r in rows if r["ok"] is False]
+        if failed:
+            integrity = "FAILED: " + "; ".join("%s: %s" % (r["space"], r.get("detail") or "mismatch")
+                                               for r in failed[:5])
+        elif any(r["ok"] is None for r in rows):
+            integrity = "partial: " + "; ".join(r.get("detail", "") for r in rows if r["ok"] is None)
+        else:
+            integrity = "verified (every segment, segment table, metadata and data hash)"
+    case["integrity_status"] = integrity
     return {"format": "keto-report/1", "tool": "Keto %s" % __version__,
             "generated_utc": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
             "duration_s": round(time.time() - started, 1), "case": to_plain(case), "summary": counts,
+            "integrity": integrity,
             "attack": sorted(techniques.values(), key=lambda t: -t["findings"]), "findings": findings,
             "coverage": coverage}
 
@@ -253,9 +298,15 @@ def to_html(rep: dict) -> str:
     for s, n in rep["summary"].items():
         out.append("<div class='card'><b style='color:%s'>%d</b>%s</div>" % (colors[s], n, s))
     out.append("</div>")
+    integrity = rep.get("integrity", "")
+    if integrity.startswith("FAILED"):
+        out.append("<p><span class='sev' style='background:%s'>EVIDENCE INTEGRITY FAILED</span> %s</p>"
+                   % (colors["critical"], e(integrity)))
+    elif integrity:
+        out.append("<p class='muted'>Evidence integrity: %s</p>" % e(integrity))
     case = rep["case"]
     out.append("<h2>Case</h2><table>")
-    for k in ("image", "live", "profile", "device", "acquisition", "process", "integrity"):
+    for k in ("image", "live", "profile", "device", "acquisition", "process", "fingerprint", "integrity"):
         if case.get(k) not in (None, {}, [], False):
             out.append("<tr><th>%s</th><td><code>%s</code></td></tr>" % (e(k), e(json.dumps(case[k], default=str))))
     out.append("</table>")

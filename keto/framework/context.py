@@ -10,7 +10,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from keto.framework.exceptions import RequirementError, UnsupportedError
+from keto.framework.exceptions import FormatError, RequirementError, UnsupportedError
 from keto.framework.layers import DataLayer, FileLayer
 from keto.framework.profiles import Profile, registry
 
@@ -39,18 +39,41 @@ class Context:
         self._live = None
         self._vram_size_override = vram_size
         self.host_metadata: Dict[str, Any] = {}
-        if image:
-            self._open_image(image)
-        if host_image:
-            self._open_host(host_image)
+        if snapshot and not os.path.isfile(snapshot):
+            raise RequirementError("snapshot not found: %s" % snapshot)
+        try:
+            if image:
+                self._open_image(image)
+            if host_image:
+                if image and os.path.exists(host_image) and os.path.exists(image) and \
+                        os.path.samefile(image, host_image):
+                    raise RequirementError("--host-image is the same file as -f: give the host RAM image of the "
+                                           "machine the GPU image came from")
+                self._open_host(host_image)
+        except BaseException:
+            self.close()  # release what was opened (an open handle keeps the evidence file locked on Windows)
+            raise
+        if vram_size and self.vram is not None and self.vram.maximum_address + 1 > vram_size:
+            log.warning("--vram-size 0x%x is smaller than the VRAM image (0x%x bytes): structures above it are "
+                        "treated as out of range", vram_size, self.vram.maximum_address + 1)
+
+    @staticmethod
+    def _check_input(path: str, what: str):
+        if not os.path.exists(path):
+            raise RequirementError("%s not found: %s" % (what, path))
+        if not os.path.isfile(path):
+            raise RequirementError("%s is not a file: %s" % (what, path))
+        if os.path.getsize(path) == 0:
+            raise RequirementError("%s is empty: %s" % (what, path))
 
     # -- image handling -------------------------------------------------------
     def _open_image(self, path: str):
         from keto.formats.container import Container, is_container, is_lime, open_lime
-        if not os.path.exists(path):
-            raise RequirementError("image not found: %s" % path)
+        self._check_input(path, "image")
         if is_container(path):
             self.container = Container(path)
+            for problem in self.container.problems:
+                log.warning("evidence integrity: %s (run 'verify')", problem)
             self.metadata = self.container.metadata
             self.layers.update(self.container.layers())
             for name in ("vram", "residual", "process", "gpuva", "sysmem", "bar1", "rom"):
@@ -70,10 +93,13 @@ class Context:
 
     def _open_host(self, path: str):
         from keto.formats.container import Container, is_container, is_lime, open_lime
+        self._check_input(path, "host image")
         if is_lime(path):
             self.layers["sysmem"] = open_lime("sysmem", path)
         elif is_container(path):
             cont = Container(path)
+            for problem in cont.problems:
+                log.warning("host evidence integrity: %s (run 'verify' on it)", problem)
             layers = cont.layers()
             if "sysmem" not in layers:
                 raise RequirementError("container %s has no sysmem segments" % path)
@@ -130,8 +156,11 @@ class Context:
         if self._live is None:
             from keto.live.source import ReplaySource, SystemSource
             if self._snapshot_path:
-                with open(self._snapshot_path, "r", encoding="utf-8") as fh:
-                    self._live = ReplaySource(json.load(fh))
+                try:
+                    with open(self._snapshot_path, "r", encoding="utf-8") as fh:
+                        self._live = ReplaySource(json.load(fh))
+                except (OSError, UnicodeDecodeError, ValueError) as exc:
+                    raise FormatError("cannot read snapshot %s: %s" % (self._snapshot_path, exc))
             elif self._live_requested:
                 self._live = SystemSource()
             elif "live_snapshot" in self.metadata:
@@ -143,6 +172,11 @@ class Context:
     def set_live_source(self, source):
         self._live = source
         self._live_requested = True
+
+    def analyses_local_system(self) -> bool:
+        """True when the evidence is the machine Keto runs on (--live, not a recorded snapshot): only then do
+        plugins that read local files by default describe the evidence."""
+        return self._live_requested and not self._snapshot_path
 
     # -- output -------------------------------------------------------------------------
     def output_path(self, name: str) -> str:
@@ -167,7 +201,7 @@ class Context:
                 except (OSError, ValueError):
                     pass
         if self.container is not None:
-            self.container.file_layer().close()
+            self.container.close()
 
     def __enter__(self):
         return self

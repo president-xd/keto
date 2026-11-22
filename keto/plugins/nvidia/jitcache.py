@@ -26,6 +26,7 @@ class JitCache(Plugin, TimeLinerInterface):
               "not indexed are reported too.")
     ANALOG = "windows.shimcachemem / windows.registry.amcache (execution evidence from caches)"
     SOURCES = ("file",)
+    LOCAL_DEFAULTS = True  # without --path it reads this machine's caches (timeliner only uses it with --live)
     REQUIREMENTS = [Requirement("path", str, None, "cache directory (default: this machine's cache locations)"),
                     Requirement("dump", bool, False, "extract each entry's PTX and cubin into the output directory")]
 
@@ -61,7 +62,7 @@ class JitCache(Plugin, TimeLinerInterface):
                     except Exception as exc:
                         arch = na("cubin parse error: %s" % exc)
                 names = sorted(set(kernels) | set(mod.entries if mod else []))
-                flags = sorted({"%s:%s" % (c, i) for n in names for c, i in miners.classify(n)})
+                flags = sorted({"%s:%s" % (c, i) for n in names for c, i in miners.classify(n, context="kernel")})
                 if e.error:
                     flags.append(e.error)
                 files = na("")

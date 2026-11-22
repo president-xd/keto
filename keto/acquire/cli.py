@@ -26,7 +26,7 @@ import time
 
 from keto import __version__
 from keto.formats.container import SPACE_IDS, ContainerWriter
-from keto.framework.exceptions import RequirementError
+from keto.framework.exceptions import RequirementError, UnsupportedError
 from keto.framework.util import parse_size
 
 
@@ -54,6 +54,35 @@ def add_acquire_parser(sub):
     ap.add_argument("--address", type=lambda s: int(s, 0), default=0, help="start address of --input")
     ap.add_argument("--json-snapshot", help="also write the live snapshot as plain JSON to this path")
     ap.add_argument("--examiner", default="", help="examiner name / case reference stored in the metadata")
+    ap.add_argument("--force", action="store_true",
+                    help="replace an existing --out file (by default existing evidence is never overwritten)")
+    ap.add_argument("--phys-range", action="append", default=[], metavar="START-END",
+                    help="kcore method: acquire only this physical range, end exclusive (hex, decimal or a size "
+                         "such as 4G; repeatable)")
+    ap.add_argument("--max-bytes", type=parse_size, default=None,
+                    help="kcore method: stop once this much non-zero data is stored (e.g. 2G)")
+    ap.add_argument("--live-device", action="store_true",
+                    help="import method: record THIS machine's GPU (NVML/CUDA) as the dump's device; only correct "
+                         "when the dump was taken from this machine's GPU")
+
+
+def check_output(path: str, force: bool, inputs=()) -> None:
+    """Refuse to destroy evidence: an existing ``path`` needs ``force``, and ``path`` may never be one of the
+    ``inputs`` (an in-place import would truncate the dump before reading it)."""
+    for src in inputs:
+        if src and os.path.exists(src) and os.path.exists(path) and os.path.samefile(src, path):
+            raise RequirementError("--out %s is the input file itself: refusing to overwrite the evidence" % path)
+    if os.path.exists(path) and not force:
+        raise RequirementError("%s already exists: refusing to overwrite it (choose another --out, or --force)"
+                               % path)
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise RequirementError("output directory does not exist: %s" % parent)
+
+
+def report_written(out, writer: ContainerWriter) -> None:
+    out.write("evidence fingerprint (record it in the case notes; check with "
+              "'verify --expected-fingerprint'): %s\n" % writer.fingerprint)
 
 
 def _base_metadata(args) -> dict:
@@ -95,7 +124,7 @@ def record_snapshot(ctx_factory) -> dict:
     rec.nvml()
     rec.cuda()
     rec.now()
-    errors = {}
+    errors, not_applicable = {}, {}
     for name in sorted(PLUGINS):
         cls = PLUGINS[name]
         if "live" not in cls.SOURCES or not getattr(cls, "SNAPSHOT", True):
@@ -104,11 +133,104 @@ def record_snapshot(ctx_factory) -> dict:
         ctx.set_live_source(rec)
         try:
             _ = cls(ctx, {}).run().rows
+        except (UnsupportedError, RequirementError) as exc:  # e.g. a Windows-only plugin on Linux
+            not_applicable[name] = str(exc)
         except Exception as exc:  # record but keep going: a snapshot must be best-effort
             errors[name] = "%s: %s" % (type(exc).__name__, exc)
     snap = rec.snapshot()
     snap["plugin_errors"] = errors
+    snap["plugins_not_applicable"] = not_applicable
     return snap
+
+
+def windows_gpu_pids(src) -> dict:
+    """``pid -> [evidence]`` for Windows processes using a GPU engine or GPU memory, or loading a GPU compute
+    runtime."""
+    from keto.plugins.windows.gpu import runtimes
+    out = {}
+    for pid_s, g in (src.win_gpu().get("processes") or {}).items():
+        if any(u > 0 for u in (g.get("engines") or {}).values()) or g.get("dedicated"):
+            out.setdefault(int(pid_s), []).append("gpu-counters")
+    for p in src.win_processes():
+        rts = [r for r in runtimes(src.win_modules(p["pid"])) if r[1]]
+        if rts:
+            out.setdefault(p["pid"], []).append("runtime:" + ",".join(sorted({r[0] for r in rts})))
+    return out
+
+
+def _acquire_process_windows(args, out) -> int:
+    """Windows: committed, accessible regions through VirtualQueryEx + ReadProcessMemory, keyed by virtual address,
+    with each region's protection, type and backing file (needs PROCESS_VM_READ: same user, or Administrator)."""
+    from keto.live import windows as w
+    from keto.live.source import SystemSource
+    src = SystemSource()
+    pids = list(args.pid)
+    evidence = windows_gpu_pids(src) if args.gpu_processes else {}
+    if args.gpu_processes:
+        pids += [p for p in evidence if p not in (os.getpid(), 0, 4)]
+    if not pids:
+        raise RequirementError("process method needs --pid or --gpu-processes")
+    device = _device_metadata(src.nvml(), src.cuda(), args.device)
+    procs = {p["pid"]: p for p in src.win_processes()}
+    stem, ext = os.path.splitext(args.out)
+    pids = sorted(set(pids))
+    paths = {pid: args.out if len(pids) == 1 else "%s-%d%s" % (stem, pid, ext or ".keto") for pid in pids}
+    for p in paths.values():
+        check_output(p, args.force)
+    written = 0
+    for pid in pids:
+        info = procs.get(pid)
+        if info is None:
+            out.write("pid %d: not found\n" % pid)
+            continue
+        try:
+            h, regs = w.regions(pid)
+        except PermissionError as exc:
+            out.write("pid %d (%s): %s - run as Administrator for other users' processes\n" % (pid, info["name"], exc))
+            continue
+        path = paths[pid]
+        meta = _base_metadata(args)
+        meta["device"] = device
+        meta["process"] = {"pid": pid, "comm": info["name"], "exe": info.get("path"), "ppid": info.get("ppid"),
+                           "cmdline": src.win_cmdline(pid), "gpu_evidence": evidence.get(pid, []),
+                           "platform": "Windows"}
+        captured, skipped = [], []
+        writer = ContainerWriter(path, meta, exclusive=not args.force)
+        t0 = time.time()
+        status = "complete"
+        try:
+            for r in regs:
+                size = r["end"] - r["start"]
+                if size > args.max_mapping:
+                    skipped.append(dict(r, reason="too large"))
+                    continue
+                bad = 0
+                for pos in range(r["start"], r["end"], 4 << 20):  # bounded memory: one 4 MiB block at a time
+                    data, nbad = w.read_region(h, pos, min(4 << 20, r["end"] - pos))
+                    writer.append("process", pos, data)
+                    bad += nbad
+                captured.append({"start": r["start"], "end": r["end"], "perms": r["perms"], "path": r["path"],
+                                 "type": r["type"], "unreadable": bad})
+        except BaseException as exc:
+            status = "incomplete: %s: %s" % (type(exc).__name__, exc)
+            raise
+        finally:
+            w.close_handle(h)
+            meta["process"]["mappings"] = captured
+            meta["process"]["skipped"] = skipped
+            meta["acquisition"]["status"] = status
+            meta["acquisition"]["notes"] = ("process memory via ReadProcessMemory: %d region(s) captured, %d skipped"
+                                            % (len(captured), len(skipped)))
+            writer.metadata = meta
+            writer.close()
+        written += 1
+        out.write("pid %d (%s): %d regions, %d bytes -> %s in %.1fs (%d skipped)\n" % (
+            pid, info["name"], len(captured), sum(s.length for s in writer.segments), path, time.time() - t0,
+            len(skipped)))
+        report_written(out, writer)
+    if not written:
+        raise RequirementError("no process was captured")
+    return 0
 
 
 def _acquire_process(args, out) -> int:
@@ -117,6 +239,8 @@ def _acquire_process(args, out) -> int:
     Needs root (or CAP_SYS_PTRACE) for processes that are not descendants of the
     caller when kernel.yama.ptrace_scope >= 1. Each PID gets its own container whose
     'process' segments are keyed by virtual address."""
+    if os.name == "nt":
+        return _acquire_process_windows(args, out)
     from keto.live import procfs
     from keto.live.source import SystemSource
     src = SystemSource()
@@ -128,21 +252,33 @@ def _acquire_process(args, out) -> int:
         raise RequirementError("process method needs --pid or --gpu-processes")
     device = _device_metadata(src.nvml(), src.cuda(), args.device)
     stem, ext = os.path.splitext(args.out)
-    for pid in sorted(set(pids)):
+    pids = sorted(set(pids))
+    paths = {pid: args.out if len(pids) == 1 else "%s-%d%s" % (stem, pid, ext or ".keto") for pid in pids}
+    for p in paths.values():
+        check_output(p, args.force)
+    written = 0
+    for pid in pids:
         proc = src.proc(pid)
         if proc is None:
             out.write("pid %d: not found / not readable\n" % pid)
             continue
-        path = args.out if len(set(pids)) == 1 else "%s-%d%s" % (stem, pid, ext or ".keto")
+        path = paths[pid]
         meta = _base_metadata(args)
         meta["device"] = device
         meta["process"] = {k: proc.get(k) for k in ("pid", "comm", "cmdline", "exe", "uid", "ppid", "start_time")}
         meta["process"]["gpu_evidence"] = sorted(procfs.gpu_processes(src).get(pid, {}).get("evidence", []))
         captured, skipped = [], []
-        writer = ContainerWriter(path, meta)
-        t0 = time.time()
         try:
-            with open("/proc/%d/mem" % pid, "rb", buffering=0) as mem:
+            mem = open("/proc/%d/mem" % pid, "rb", buffering=0)
+        except PermissionError as exc:
+            out.write("pid %d (%s): cannot read /proc/%d/mem (%s): run as root or use a descendant process\n"
+                      % (pid, proc["comm"], pid, exc))
+            continue
+        writer = ContainerWriter(path, meta, exclusive=not args.force)
+        t0 = time.time()
+        status = "complete"
+        try:
+            with mem:
                 for m in proc["maps"]:
                     size = m["end"] - m["start"]
                     if "r" not in m["perms"] or m["path"] in ("[vvar]", "[vsyscall]", "[vvar_vclock]") or \
@@ -151,41 +287,74 @@ def _acquire_process(args, out) -> int:
                                         "reason": "not readable" if "r" not in m["perms"] else
                                         ("too large" if size > args.max_mapping else "kernel page")})
                         continue
-
-                    def chunks(m=m):
-                        pos = m["start"]
-                        while pos < m["end"]:
-                            n = min(4 << 20, m["end"] - pos)
-                            mem.seek(pos)
-                            yield mem.read(n)
-                            pos += n
-                    try:
-                        data = b"".join(chunks())
-                    except OSError as exc:
-                        skipped.append({"start": m["start"], "end": m["end"], "path": m["path"], "reason": str(exc)})
-                        continue
-                    writer.add_segment("process", m["start"], data)
-                    captured.append({"start": m["start"], "end": m["end"], "perms": m["perms"], "path": m["path"]})
-        except PermissionError as exc:
-            raise RequirementError("cannot read /proc/%d/mem (%s): run as root or use a descendant process"
-                                   % (pid, exc))
+                    bad = _copy_mapping(mem, writer, m["start"], m["end"])
+                    captured.append({"start": m["start"], "end": m["end"], "perms": m["perms"], "path": m["path"],
+                                     "unreadable": bad})
+        except BaseException as exc:
+            status = "incomplete: %s: %s" % (type(exc).__name__, exc)
+            raise
         finally:
             meta["process"]["mappings"] = captured
             meta["process"]["skipped"] = skipped
+            meta["acquisition"]["status"] = status
             meta["acquisition"]["notes"] = ("process memory via /proc/%d/mem: %d mapping(s) captured, %d skipped"
                                             % (pid, len(captured), len(skipped)))
             writer.metadata = meta
             writer.close()
+        written += 1
         out.write("pid %d (%s): %d mappings, %d bytes -> %s in %.1fs (%d skipped)\n" % (
             pid, proc["comm"], len(captured), sum(s.length for s in writer.segments), path, time.time() - t0,
             len(skipped)))
+        report_written(out, writer)
+    if not written:
+        raise RequirementError("no process was captured")
     return 0
+
+
+def _copy_mapping(mem, writer: ContainerWriter, start: int, end: int, block: int = 4 << 20) -> int:
+    """Stream ``[start, end)`` of a /proc/<pid>/mem handle into the container, one block at a time. A block that
+    fails or reads short is retried page by page; unreadable pages are left out (a gap in the segment list, never
+    zeros) and counted. Returns the number of unreadable bytes."""
+    bad = 0
+    pos = start
+    while pos < end:
+        n = min(block, end - pos)
+        try:
+            mem.seek(pos)
+            data = mem.read(n)
+        except (OSError, ValueError, OverflowError):
+            data = b""
+        if len(data) == n:
+            writer.append("process", pos, data)
+        else:
+            for p in range(pos, pos + n, 0x1000):
+                m = min(0x1000, pos + n - p)
+                try:
+                    mem.seek(p)
+                    page = mem.read(m)
+                except (OSError, ValueError, OverflowError):
+                    page = b""
+                if page:
+                    writer.append("process", p, page)
+                bad += m - len(page)
+        pos += n
+    return bad
 
 
 def run_acquire(args, out) -> int:
     from keto.framework.context import Context
     if args.method == "process":
         return _acquire_process(args, out)
+    if args.method == "import":
+        if not args.input or not os.path.isfile(args.input):
+            raise RequirementError("--input must name an existing dump file for the import method")
+        if os.path.getsize(args.input) == 0:
+            raise RequirementError("--input %s is empty" % args.input)
+        check_output(args.out, args.force, inputs=[args.input])
+    else:
+        check_output(args.out, args.force)
+    if args.json_snapshot:
+        check_output(args.json_snapshot, args.force, inputs=[args.out])
     if args.method == "kcore":
         from keto.acquire.kcore import acquire_kcore
         return acquire_kcore(args, out, _base_metadata(args))
@@ -203,31 +372,37 @@ def run_acquire(args, out) -> int:
         if args.json_snapshot:
             with open(args.json_snapshot, "w", encoding="utf-8") as fh:
                 json.dump(snapshot, fh)
-    elif args.method in ("snapshot", "cuda", "import"):
+    elif args.method in ("snapshot", "cuda") or (args.method == "import" and args.live_device):
+        # an imported dump comes from wherever it was taken: this machine's GPU is recorded only on request
         from keto.live.source import SystemSource
         src = SystemSource()
         meta["device"] = _device_metadata(src.nvml(), src.cuda(), args.device)
-    writer = ContainerWriter(args.out, meta)
+        if args.method == "import":
+            meta["device"]["source"] = "recorded from the acquiring machine (--live-device)"
+    writer = ContainerWriter(args.out, meta, exclusive=not args.force)
+    status = "complete"
     try:
         if args.method == "cuda":
             _acquire_cuda(args, writer, meta, out)
         elif args.method == "import":
-            if not args.input or not os.path.exists(args.input):
-                raise RequirementError("--input must name an existing dump for the import method")
-
-            def chunks(path):
-                with open(path, "rb") as fh:
-                    for c in iter(lambda: fh.read(1 << 22), b""):
-                        yield c
-
-            writer.add_segment(args.space, args.address, chunks(args.input))
             meta["acquisition"]["source_file"] = os.path.abspath(args.input)
+            meta["acquisition"]["source_size"] = os.path.getsize(args.input)
+            with open(args.input, "rb") as fh:
+                pos = args.address
+                for c in iter(lambda: fh.read(1 << 22), b""):
+                    writer.append(args.space, pos, c)
+                    pos += len(c)
+    except BaseException as exc:
+        status = "incomplete: %s: %s" % (type(exc).__name__, exc)
+        raise
     finally:
+        meta["acquisition"]["status"] = status
         writer.metadata = meta
         writer.close()
     out.write("wrote %s (%d segment(s)) in %.1fs\n" % (args.out, len(writer.segments), time.time() - t0))
     for s, h in zip(writer.segments, writer.hashes):
         out.write("  %-8s 0x%012x %10d bytes sha256=%s\n" % (s.space_name, s.address, s.length, h))
+    report_written(out, writer)
     return 0
 
 

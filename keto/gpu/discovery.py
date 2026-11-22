@@ -22,7 +22,7 @@ from keto.formats import ptx as ptx_fmt
 from keto.formats.elf import elf_extent
 from keto.framework.exceptions import UnsupportedError
 from keto.framework.layers import DataLayer
-from keto.framework.scanners import BytesScanner, RegexScanner, scan, scan_aligned_u32
+from keto.framework.scanners import BytesScanner, RegexScanner, byte_prefilter, scan, scan_aligned_u32
 from keto.gpu import pushbuf, qmd as qmd_fmt, sass
 from keto.gpu.gmmu import VID, GmmuLayer, GmmuWalker, build_reverse_index
 from keto.gpu.ramin import InstanceBlock, parse_instance_block, read_userd
@@ -43,18 +43,21 @@ def instance_blocks(ctx, include_invalid: bool = False) -> List[InstanceBlock]:
         fc = prof.ramfc
         mask, value = fc.get("signature_mask", 0xFFFF), fc.get("signature_value", 0xFACE)
         out = []
-        for pa, _ in scan_aligned_u32(layer, fc["signature"], 4096, lambda v: (v & mask) == value):
+        for pa, _ in scan_aligned_u32(layer, fc["signature"], 4096, lambda v: (v & mask) == value,
+                                      prefilter=byte_prefilter(fc["signature"], mask, value)):
             ib = parse_instance_block(layer, pa, prof, ctx.vram_size)
             if ib.valid or include_invalid:
                 out.append(ib)
-        if "userd_lo" not in fc and not include_invalid:
-            # Ampere+: RAMFC no longer records USERD; the runlist entry is the only place that does
-            for rl in _scan_runlists(ctx, {ib.pa for ib in out}):
+        if "userd_lo" not in fc:
+            # Ampere+: RAMFC no longer records USERD; the runlist entry is the only place that does (runlists are
+            # anchored on the validated blocks, also when the invalid hits are listed too)
+            by_pa = {ib.pa: ib for ib in out}
+            for rl in (runlists(ctx) if include_invalid else _scan_runlists(ctx, set(by_pa))):
                 for c in rl.channels():
-                    for ib in out:
-                        if ib.pa == c.inst_addr and c.userd_addr:
-                            ib.userd_addr, ib.userd_aperture = c.userd_addr, c.userd_aperture
-                            ib.reasons.append("USERD from runlist")
+                    ib = by_pa.get(c.inst_addr)
+                    if ib is not None and c.userd_addr:
+                        ib.userd_addr, ib.userd_aperture = c.userd_addr, c.userd_aperture
+                        ib.reasons.append("USERD from runlist")
         for ib in out:
             read_userd(ib, ctx.aperture_layers(), prof)
         return out
@@ -187,8 +190,13 @@ def reverse_lookup_all(ctx, pa: int) -> List[Tuple[AddressSpace, int, object]]:
 # CUDA code containers
 # ------------------------------------------------------------------------------------------
 class FoundCubin:
-    def __init__(self, layer: str, offset: int, size: int, cubin, error: Optional[str] = None, source: str = "scan"):
+    """``offset``/``size`` locate the object in ``layer``; for decompressed cubins (fatbin entries, zstd frames)
+    ``blob`` holds the decompressed bytes."""
+
+    def __init__(self, layer: str, offset: int, size: int, cubin, error: Optional[str] = None, source: str = "scan",
+                 blob: Optional[bytes] = None):
         self.layer, self.offset, self.size, self.cubin, self.error, self.source = layer, offset, size, cubin, error, source
+        self.blob = blob
 
     @property
     def kernels(self):
@@ -221,18 +229,37 @@ def scan_layers(ctx) -> List[DataLayer]:
 
 def cubins(ctx) -> List[FoundCubin]:
     def build():
+        from keto.gpu.artifacts import zstd_cubins
         found = []
         for layer in scan_layers(ctx):
-            found += _scan_cubins(layer)
+            # cubins inside raw zstd frames (driver binaries and host memory); silent without a zstd back-end
+            zs = list(zstd_cubins(layer))
+            frames = [(foff, foff + csize) for foff, csize, _, _ in zs]
+            found += [fc for fc in _scan_cubins(layer) if not any(s <= fc.offset < e for s, e in frames)]
+            for foff, csize, pos, blob in zs:
+                src = "zstd frame (cubin at +0x%x)" % pos
+                try:
+                    found.append(FoundCubin(layer.name, foff, len(blob), cubin_fmt.parse_cubin(blob), source=src,
+                                            blob=blob))
+                except Exception as exc:
+                    found.append(FoundCubin(layer.name, foff, len(blob), None, str(exc), source=src, blob=blob))
         # cubins embedded in fatbins (decompressed)
         for fb in fatbins(ctx):
             for e in fb["fatbin"].entries:
-                if e.kind == fatbin_fmt.KIND_ELF and e.data:
+                if e.kind != fatbin_fmt.KIND_ELF:
+                    continue
+                src = "fatbin%s" % (" (%s)" % e.compression if e.compressed else "")
+                data = e.data
+                if data is None:  # say which entries could not be decoded
+                    found.append(FoundCubin(fb["layer"], e.offset, e.size, None, e.error or "undecodable",
+                                            source=src))
+                elif data:
                     try:
-                        found.append(FoundCubin(fb["layer"], e.offset, len(e.data), cubin_fmt.parse_cubin(e.data),
-                                                source="fatbin%s" % (" (%s)" % e.compression if e.compressed else "")))
+                        found.append(FoundCubin(fb["layer"], e.offset, len(data), cubin_fmt.parse_cubin(data),
+                                                source=src, blob=data))
                     except Exception as exc:
-                        found.append(FoundCubin(fb["layer"], e.offset, len(e.data), None, str(exc), source="fatbin"))
+                        found.append(FoundCubin(fb["layer"], e.offset, len(data), None, str(exc), source=src,
+                                                blob=data))
         for path in ctx.cache.get("reference_files", []):
             found += reference_cubins(path)
         return found
@@ -269,7 +296,10 @@ def fatbins(ctx) -> List[dict]:
                 if not 0 < size < (256 << 20):
                     continue
                 data = layer.read(off, min(16 + size, layer.maximum_address + 1 - off), pad=True)
-                fb = fatbin_fmt.parse_fatbin(data, off)
+                try:  # one malformed object never aborts the scan
+                    fb = fatbin_fmt.parse_fatbin(data, off)
+                except Exception:
+                    continue
                 if fb:
                     out.append({"layer": layer.name, "offset": off, "fatbin": fb})
         return out
@@ -282,7 +312,10 @@ def fatbin_wrappers(ctx) -> List[dict]:
         out = []
         for layer in scan_layers(ctx):
             for off, _ in scan(layer, BytesScanner(fatbin_fmt.WRAPPER_MAGIC_BYTES)):
-                w = fatbin_fmt.parse_wrapper(layer.read(off, 24, pad=True))
+                try:
+                    w = fatbin_fmt.parse_wrapper(layer.read(off, 24, pad=True))
+                except Exception:
+                    continue
                 if w:
                     w.update(layer=layer.name, offset=off)
                     out.append(w)
@@ -295,18 +328,26 @@ def ptx_modules(ctx) -> List[dict]:
     def build():
         out = []
         seen = set()
+        # PTX entries of fat binaries are reported from the fatbin (decompressed when needed): text found inside a
+        # fatbin's extent is that same entry
+        in_fatbin = [(fb["layer"], fb["offset"], fb["offset"] + fb["fatbin"].total_size) for fb in fatbins(ctx)]
         for layer in scan_layers(ctx):
             for off, m in scan(layer, RegexScanner(ptx_fmt.VERSION_RE, max_length=32)):
+                if any(n == layer.name and s <= off < e for n, s, e in in_fatbin):
+                    continue
                 window_start = max(layer.minimum_address, off - 4096)
                 data = layer.read(window_start, min(4 << 20, layer.maximum_address + 1 - window_start), pad=True)
-                span = ptx_fmt.carve(data, off - window_start)
+                try:
+                    span = ptx_fmt.carve(data, off - window_start)
+                    mod = ptx_fmt.parse(data[span[0]:span[1]]) if span else None
+                except Exception:
+                    continue
                 if not span:
                     continue
                 start, end = window_start + span[0], window_start + span[1]
                 if (layer.name, start) in seen:
                     continue
                 seen.add((layer.name, start))
-                mod = ptx_fmt.parse(data[span[0]:span[1]])
                 if mod.target is None and not mod.entries:
                     continue
                 out.append({"layer": layer.name, "offset": start, "size": end - start, "module": mod,
@@ -453,17 +494,20 @@ def channel_commands(ctx) -> List[ChannelCommands]:
 class Launch:
     def __init__(self, channel: ChannelCommands, event, qmd, qmd_raw: Optional[bytes]):
         self.channel, self.event, self.qmd, self.qmd_raw = channel, event, qmd, qmd_raw
+        self.state = "unknown"  # ring state of the GPFIFO entry holding the launch (consumed / pending / unknown)
         self.program_va: Optional[int] = None
         self.program_pa: Optional[int] = None
         self.program_mapping = None
         self.kernel: Optional[KernelCode] = None
+        #: index of the QMD sub-task this launch describes (V05_01 tasks launch one program per sub-task)
+        self.sub_task = 0
 
 
 def launches(ctx) -> List[Launch]:
     def build():
         out = []
         for cc in channel_commands(ctx):
-            for ev in cc.events:
+            for ev, state in ((ev, seg["state"]) for seg in cc.segments for ev in seg["events"]):
                 if ev.kind != "launch":
                     continue
                 va = ev.details["qmd_va"]
@@ -471,16 +515,21 @@ def launches(ctx) -> List[Launch]:
                 if cc.aspace and cc.aspace.translate(va):
                     raw = cc.aspace.layer.read(va, qmd_fmt.MAX_QMD_SIZE, pad=True)
                     q = qmd_fmt.decode(raw)  # version read from the descriptor itself
-                ln = Launch(cc, ev, q, raw)
-                if q is not None:
-                    ln.program_va = q.resolve_program(ev.details.get("program_region"))
-                if ln.program_va is not None and cc.aspace:
-                    t = cc.aspace.translate(ln.program_va)
-                    if t:
-                        ln.program_mapping, ln.program_pa = t
-                        if t[0].aperture == VID:
-                            ln.kernel = code_at(ctx, t[1])
-                out.append(ln)
+                # a V05_01 task runs one program per sub-task: each becomes its own launch, so every consumer
+                # (kernels, malfind, suspiciouslaunch, vamap...) checks all of them
+                for view in (q.sub_tasks if q is not None else [None]):
+                    ln = Launch(cc, ev, view, raw)
+                    ln.state = state
+                    ln.sub_task = view.sub_task if view is not None else 0
+                    if view is not None:
+                        ln.program_va = view.resolve_program(ev.details.get("program_region"))
+                    if ln.program_va is not None and cc.aspace:
+                        t = cc.aspace.translate(ln.program_va)
+                        if t:
+                            ln.program_mapping, ln.program_pa = t
+                            if t[0].aperture == VID:
+                                ln.kernel = code_at(ctx, t[1])
+                    out.append(ln)
         return out
 
     return ctx.cached("launches", build)

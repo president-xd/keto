@@ -81,6 +81,24 @@ All scanning runs in C:
 
 Python's `re` does not optimise large alternations, so a single combined regex would be 30x slower.
 
+Large images:
+
+- **No copies.** File-backed layers (raw dumps, `.keto` containers) expose their memory mappings
+  (`regions()` / `iter_views()`); `bytes.find`-style searches and regexes run on the mapping itself, and the aligned
+  scanners read zero-copy `memoryview`s. Signature scans take a one-byte prefilter (`byte_prefilter`) so only
+  candidates reach Python.
+- **All cores.** `scan()` splits images of 512 MiB or more into 256 MiB parts and runs them in a persistent process
+  pool (`framework/parallel.py`); each worker maps the file itself, and regex matches come back as picklable
+  `PMatch` objects. `--workers N` / `KETO_WORKERS` (0 or 1 = single process).
+- **Exact boundaries.** Every part (and every chunk on the single-process chunked path) is scanned with the
+  scanner's overlap as look-*ahead* and as look-*behind*, and keeps only hits that start inside it. The look-behind
+  is what lets a match that began in the previous part be recognised as such, instead of its tail being reported as
+  a new match at the boundary; every hit is reported exactly once, whatever the part size. Multi-anchor scanners
+  return their hits sorted by offset, so output order does not depend on `--workers`.
+- **Algorithms.** AES schedules are found with a linear prefilter (XOR of the image with itself shifted by 4 and
+  4*Nk bytes leaves zero runs where schedules start); QMD candidates get a field-level plausibility check before
+  full decoding.
+
 ## Live sources and snapshots
 
 Live plugins never touch the OS directly; they call the `LiveSource` API (`nvml()`, `proc(pid)`, `read_text()`,
@@ -105,10 +123,14 @@ an ISF:
 
 ## Windows live view (live/windows.py)
 
-Toolhelp32 process/module snapshots, `EnumWindows`, and the PDH `GPU Engine` / `GPU Process Memory` counters,
-exposed through the LiveSource methods `win_processes`, `win_modules`, `win_windowed`, `win_gpu` and `registry`,
-so `windows.gpuprocs` and `nvidia.malware.watchdog` are recorded into snapshots and replayed like every other
-live plugin.
+Toolhelp32 process/module snapshots, `EnumWindows`, the PDH `GPU Engine` / `GPU Process Memory` / `GPU Adapter
+Memory` counters, DXGI `EnumAdapters1` (adapter names and LUIDs), command lines from each process's PEB, and
+Authenticode verification (`WinVerifyTrust`: embedded signature, then the system catalogs with the catalog admin
+context kept open; no revocation or network), exposed through the LiveSource methods `win_processes`,
+`win_modules`, `win_windowed`, `win_gpu`, `win_adapters`, `win_cmdline`, `win_signature` and `registry`, so the
+Windows plugins are recorded into snapshots and replayed like every other live plugin. When run elevated,
+`SeDebugPrivilege` is enabled so system and other users' processes become readable (protected processes stay
+closed). `VirtualQueryEx`/`ReadProcessMemory` back the Windows process acquisition.
 
 ## Adding a plugin
 

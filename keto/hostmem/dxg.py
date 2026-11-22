@@ -151,15 +151,40 @@ def walk_processes(km: KernelMemory) -> dict:
 
 
 # -- Linux tasks and their open files ------------------------------------------------------------------------
-def walk_tasks(km: KernelMemory, limit: int = 1 << 16) -> Iterator[dict]:
-    """Thread-group leaders on ``init_task.tasks``."""
+def walk_tasks(km: KernelMemory, limit: int = 1 << 16, errors: Optional[List[str]] = None) -> Iterator[dict]:
+    """Thread-group leaders on ``init_task.tasks``. With ``errors``, an unreadable link (a task freed while a live
+    system was imaged) ends the walk and is recorded there instead of raising."""
     init = km.obj("task_struct", km.sym("init_task"))
-    for t in [init] + list(init.list("tasks", "task_struct", "tasks", limit)):
+    tasks = [init]
+    try:
+        for t in init.list("tasks", "task_struct", "tasks", limit):
+            tasks.append(t)
+    except InvalidAddressException as exc:
+        if errors is None:
+            raise
+        errors.append("init_task.tasks: walk stopped after %d task(s): %s" % (len(tasks), exc))
+    for t in tasks:
         try:
             yield {"va": t.va, "pid": t["pid"], "tgid": t["tgid"], "comm": t.string("comm"), "files": t["files"],
                    "mm": t["mm"]}
         except (InvalidAddressException, BtfError):
             continue
+
+
+def task_nspid(km: KernelMemory, task_va: int) -> Optional[int]:
+    """PID of a task in its own PID namespace (``task->thread_pid->numbers[level].nr``, what
+    /proc/<pid>/status shows last in NSpid) or None when unreadable."""
+    try:
+        pid_va = km.u64(task_va + km.btf.offsetof("task_struct", "thread_pid"))
+        if not pid_va:
+            return None
+        level = km.u32(pid_va + km.btf.offsetof("pid", "level"))
+        if level > 32:  # MAX_PID_NS_LEVEL
+            return None
+        upid = pid_va + km.btf.offsetof("pid", "numbers") + level * km.btf.struct("upid").size
+        return int.from_bytes(km.read(upid + km.btf.offsetof("upid", "nr"), 4), "little", signed=True)
+    except (InvalidAddressException, BtfError):
+        return None
 
 
 def task_files(km: KernelMemory, files_va: int, max_fds: int = 1 << 16) -> Iterator[tuple]:
@@ -191,7 +216,7 @@ def dxg_cross_view(km: KernelMemory) -> dict:
     """Join dxgprocess objects with tasks and the ``/dev/dxg`` files they hold."""
     walk = walk_processes(km)
     fops = km.symbols.get("dxgk_fops")
-    tasks = list(walk_tasks(km))
+    tasks = list(walk_tasks(km, errors=walk["errors"]))
     by_tgid = {t["tgid"]: t for t in tasks}
     holders: Dict[int, List[tuple]] = {}  # dxgprocess va -> [(pid, comm, fd)]
     task_errors = 0

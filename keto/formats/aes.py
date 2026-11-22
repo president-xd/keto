@@ -9,6 +9,7 @@ little-endian (OpenSSL ``AES_KEY`` / T-table implementations on x86/ARM).
 
 from __future__ import annotations
 
+import re
 from typing import Iterator, List, Tuple
 
 SBOX = bytes.fromhex(
@@ -48,36 +49,61 @@ def _swap_words(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _quick(data: bytes, o: int, nk: int) -> bool:
-    """Check the first expansion word only (cheap rejection)."""
-    p = o + 4 * (nk - 1)
-    q = o + 4 * nk
-    return (data[q] == data[o] ^ SBOX[data[p + 1]] ^ 1 and data[q + 1] == data[o + 1] ^ SBOX[data[p + 2]]
-            and data[q + 2] == data[o + 2] ^ SBOX[data[p + 3]] and data[q + 3] == data[o + 3] ^ SBOX[data[p]])
+# Linear prefilter. For key words W[i] with i % Nk != 0 (and, for AES-256, i % Nk != 4) the expansion is linear:
+# W[i] = W[i-Nk] ^ W[i-1]. So E[p] = d[p] ^ d[p - 4*Nk] ^ d[p - 4] is zero across those words of a schedule:
+# 3 words (12 bytes) from byte 20 for AES-128, 5 words (20 bytes) from byte 28 for AES-192, 3 words from byte 36
+# for AES-256. E for a whole chunk is three big-integer operations, and its zero runs are found by a C regex, so
+# only real candidates reach the full check. Swapping bytes within words does not change XOR relations between
+# whole words, so one pass serves both byte orders.
+_LINEAR = {16: (4, 20, 12), 24: (6, 28, 20), 32: (8, 36, 12)}  # key bytes -> (Nk, zero window offset, length)
+# (spelled with a literal prefix of zero bytes, which the regex engine searches for at C speed)
+_RUNS = {ks: re.compile(re.escape(b"\x00" * ln) + rb"\x00{0,8}") for ks, (_nk, _o, ln) in _LINEAR.items()}
+# Zero-filled memory satisfies the recurrence trivially (0 ^ 0 ^ 0). E is blanked over every run of >= 64 zero data
+# bytes before the regex runs, so zero pages cost one C-level slice each instead of a Python check per offset. No
+# real schedule is lost: 64 zero bytes hold 15 whole zero words, and among them is a word W[i] (i % Nk == 0, or
+# i % 8 == 4 for AES-256) whose W[i-Nk] and W[i-1] are zero too, so W[i] = SubWord(0) (^ Rcon) != 0; a run reaching
+# from before a schedule into its zero window zeroes W[0] and W[Nk-1] and therefore W[Nk], so it cannot exist either.
+_ZERO_DATA = re.compile(re.escape(b"\x00" * 64) + rb"\x00*")
 
 
 def find_key_schedules(data: bytes, base: int = 0, align: int = 4, key_sizes=(16, 24, 32),
                        skip_low_entropy: bool = True) -> Iterator[Tuple[int, int, str, bytes]]:
-    """Yield ``(offset, key_bits, byte_order, key)`` for every exact schedule found."""
-    views = [("bytes", data), ("u32-le", _swap_words(data[:len(data) - len(data) % 4]))]
+    """Yield ``(offset, key_bits, byte_order, key)`` for every exact schedule found (FIPS byte order, or
+    32-bit words stored little-endian)."""
+    data = bytes(data)
     n = len(data)
-    page = 4096
-    for order, buf in views:
-        for pstart in range(0, n, page):
-            chunk = buf[pstart:pstart + page + 240]
-            if skip_low_entropy and (chunk.count(0) > len(chunk) * 0.9 or len(set(chunk[:page])) < 32):
-                continue
-            for o in range(pstart - pstart % align, min(pstart + page, n - 16), align):
-                for ks in key_sizes:
-                    nk = ks // 4
-                    end = o + SCHEDULE_LEN[ks]
-                    if end > len(buf) or not _quick(buf, o, nk):
-                        continue
-                    key = bytes(buf[o:o + ks])
-                    if len(set(key)) < 4:
-                        continue
-                    if expand_key(key) == bytes(buf[o:end]):
-                        yield base + o, ks * 8, order, key
+    if n < 176:
+        return
+    if align < 1:
+        raise ValueError("align must be >= 1")
+    a = int.from_bytes(data, "little")
+    mask = (1 << (8 * n)) - 1
+    a4 = a ^ (a << 32)
+    zero_runs = [m.span() for m in _ZERO_DATA.finditer(data)]
+    ones = memoryview(b"\xff" * max((e - s for s, e in zero_runs), default=0))
+    for ks in key_sizes:
+        nk, off, ln = _LINEAR[ks]
+        eb = bytearray(((a4 ^ (a << (32 * nk))) & mask).to_bytes(n, "little"))
+        for s, e in zero_runs:
+            eb[s:e] = ones[:e - s]
+        seen = set()
+        for m in _RUNS[ks].finditer(eb):
+            for o in range(max(0, m.start() - off), m.end() - off - ln + 1):
+                if o % align or o in seen:
+                    continue
+                seen.add(o)
+                end = o + SCHEDULE_LEN[ks]
+                if end > n:
+                    continue
+                sched = data[o:end]
+                if skip_low_entropy and len(set(sched[:ks])) < 4:
+                    continue
+                if expand_key(sched[:ks]) == sched:
+                    yield base + o, ks * 8, "bytes", sched[:ks]
+                    continue
+                sw = _swap_words(sched)
+                if (not skip_low_entropy or len(set(sw[:ks])) >= 4) and expand_key(sw[:ks]) == sw:
+                    yield base + o, ks * 8, "u32-le", sw[:ks]
 
 
 def entropy_ok(key: bytes) -> bool:

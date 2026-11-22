@@ -4,16 +4,44 @@ from __future__ import annotations
 
 import datetime as _dt
 import gzip
+import os
 import re
+import zlib
 from typing import List
 
-from keto.framework.exceptions import RequirementError
+from keto.framework.exceptions import FormatError, RequirementError, UnsupportedError
 from keto.framework.plugin import Plugin, Requirement, TimeLinerInterface
 from keto.framework.treegrid import TreeGrid, na
 from keto.framework.util import human_size
 from keto.indicators import xid as xid_ind
-from keto.plugins.nvidia.live_procs import (MODPROBE_DIRS, _na_of, modprobe_entries, nvml_devices, read_params,
-                                                 require_linux)
+from keto.plugins.nvidia.live_procs import (DISPLAY_CLASS, MODPROBE_DIRS, NVLDDMKM_KEY, SERVICES_KEY,
+                                                 WIN_NVIDIA_DIRS_RE, _na_of, display_adapter_keys, modprobe_entries,
+                                                 nvml_devices, read_params, require_linux, win_driver_files,
+                                                 win_rm_profiling)
+from keto.plugins.windows import gpu as wgpu
+
+ENUM_PCI_KEY = r"HKLM\SYSTEM\CurrentControlSet\Enum\PCI"
+GRAPHICS_DRIVERS_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+
+
+def win_kernel_drivers(src):
+    """``[(loaded driver, version info)]`` of the loaded NVIDIA kernel drivers (driver store / NVIDIA company)
+    and the Microsoft graphics kernel (dxgkrnl, dxgmms)."""
+    out = []
+    for drv in src.win_drivers() or []:
+        name, path = (drv.get("name") or "").lower(), drv.get("path") or ""
+        if name.startswith(("dxgkrnl", "dxgmms")) or WIN_NVIDIA_DIRS_RE.search(path) or name.startswith("nv"):
+            ver = src.win_file_version(path) or {}
+            if name.startswith(("dxgkrnl", "dxgmms")) or WIN_NVIDIA_DIRS_RE.search(path) or \
+                    "nvidia" in (ver.get("company") or "").lower():
+                out.append((drv, ver))
+    return out
+
+
+def _sig_text(sig):
+    if not sig:
+        return na("not checked")
+    return "%s (%s, %s)" % (sig.get("status"), sig.get("signer") or "-", sig.get("kind") or "-")
 
 
 def nvv(value):
@@ -34,8 +62,17 @@ def nvv(value):
 
 def _mem(v):
     if isinstance(v, dict) and "_na" not in v:
-        return "total %s, used %s, free %s" % (human_size(v["total"]), human_size(v["used"]), human_size(v["free"]))
+        return "total %s, used %s, free %s%s" % (human_size(v["total"]), human_size(v["used"]), human_size(v["free"]),
+                                                 ", reserved %s" % human_size(v["reserved"]) if "reserved" in v else "")
     return nvv(v)
+
+
+#: NVML enable-state fields (nvmlEnableState_t 0/1), shown as nvidia-smi does
+ENABLE_STATE_FIELDS = {"persistence_mode", "display_mode", "display_active", "accounting_mode"}
+
+
+def _enabled(v):
+    return {0: "Disabled", 1: "Enabled"}.get(v, nvv(v)) if isinstance(v, int) and not isinstance(v, bool) else nvv(v)
 
 
 DEVICE_FIELDS = [("name", "Name"), ("uuid", "UUID"), ("serial", "Serial"), ("board_part_number", "Board part"),
@@ -57,8 +94,9 @@ class Devices(Plugin):
     DESCRIPTION = ("Shows every GPU's identity and configuration: name, UUID, serial, VBIOS/InfoROM, PCI location, "
                    "framebuffer and BAR1 memory, persistence/compute/MIG/driver modes, power, thermals and PCIe link.")
     METHOD = ("NVML: nvmlSystemGet{Driver,NVML,CudaDriver}Version and per device nvmlDeviceGet{Name,UUID,Serial,"
-              "VbiosVersion,InforomImageVersion,PciInfo_v3,MemoryInfo,BAR1MemoryInfo,PersistenceMode,ComputeMode,"
-              "DriverModel,MigMode,PowerUsage,Temperature,CurrPcieLink*}; unsupported queries are shown as N/A.")
+              "VbiosVersion,InforomImageVersion,PciInfo_v3,MemoryInfo_v2 (used excludes the reserved framebuffer; "
+              "v1 where v2 is missing),BAR1MemoryInfo,PersistenceMode,ComputeMode,DriverModel,MigMode,PowerUsage,"
+              "Temperature,CurrPcieLink*}; unsupported queries are shown as N/A.")
     ANALOG = "windows.info"
     SOURCES = ("live",)
 
@@ -74,7 +112,8 @@ class Devices(Plugin):
                 yield 0, (gpu, "Device", nvv(d.get("name")))
                 for key, label in DEVICE_FIELDS[1:]:
                     v = d.get(key)
-                    yield 1, (gpu, label, _mem(v) if key in ("memory", "bar1") else nvv(v))
+                    yield 1, (gpu, label, _mem(v) if key in ("memory", "bar1") else
+                              _enabled(v) if key in ENABLE_STATE_FIELDS else nvv(v))
         return TreeGrid([("GPU", str), ("Field", str), ("Value", str)], rows())
 
 
@@ -186,9 +225,60 @@ class DeviceTree(Plugin):
                    "paravirtualised /dev/dxg adapter.")
     METHOD = ("Joins NVML PCI info with /sys/bus/pci/devices/<domain:bus:dev.fn>/{vendor,device,class,driver,"
               "iommu_group,numa_node,current_link_speed,current_link_width,max_link_speed}; NVIDIA functions without "
-              "an NVML device (vendor 0x10de) are listed too.")
+              "an NVML device (vendor 0x10de) are listed too. On Windows the NVIDIA PCI functions come from "
+              "HKLM\\SYSTEM\\CurrentControlSet\\Enum\\PCI\\VEN_10DE* (DeviceDesc, LocationInformation, Service, "
+              "Driver key, HardwareID) matched to NVML devices by bus/device, plus the DXGI adapters (LUID, PCI "
+              "ids, memory).")
     ANALOG = "windows.devicetree"
     SOURCES = ("live",)
+
+    def _windows(self, src, devices):
+        functions = []
+        for dev in (src.registry_key(ENUM_PCI_KEY) or {}).get("subkeys", []):
+            if not dev.upper().startswith("VEN_10DE"):
+                continue
+            for inst in (src.registry_key(ENUM_PCI_KEY + "\\" + dev) or {}).get("subkeys", []):
+                vals = (src.registry_key("%s\\%s\\%s" % (ENUM_PCI_KEY, dev, inst)) or {}).get("values") or {}
+                loc = str(vals.get("LocationInformation") or "")
+                m = re.search(r"\((\d+),(\d+),(\d+)\)\s*$", loc) or re.search(r"bus (\d+), device (\d+), function (\d+)",
+                                                                             loc)
+                functions.append((tuple(int(x) for x in m.groups()) if m else None, dev + "\\" + inst, vals))
+
+        def details(vals):
+            hw = vals.get("HardwareID")
+            return "%s, service %s, driver key %s, hardware id %s" % (
+                str(vals.get("DeviceDesc") or "?").rsplit(";", 1)[-1], vals.get("Service") or "-",
+                vals.get("Driver") or "-", (hw[0] if isinstance(hw, list) and hw else hw) or "-")
+
+        def addr(domain, loc):
+            return "%04x:%02x:%02x.%x" % ((domain or 0,) + loc) if loc else na("no location")
+
+        def rows():
+            used = set()
+            for d in devices:
+                pci = d.get("pci") if isinstance(d.get("pci"), dict) else {}
+                bus = sysfs_bus_id(pci.get("bus_id", "")) if pci.get("bus_id") else ""
+                yield 0, ("GPU %s %s" % (d.get("index"), nvv(d.get("name"))), "nvml-device", bus or na("no PCI info"),
+                          "uuid %s" % nvv(d.get("uuid")))
+                for i, (loc, inst, vals) in enumerate(functions):
+                    if loc and pci and loc[:2] == (pci.get("bus"), pci.get("device")):
+                        used.add(i)
+                        yield 1, (inst, "pci-function", addr(pci.get("domain"), loc), details(vals))
+                for l in d.get("nvlink") if isinstance(d.get("nvlink"), list) else []:
+                    if l.get("active"):
+                        yield 1, ("nvlink%d" % l["link"], "nvlink-peer", l.get("remote_bus_id", "?"),
+                                  "NVLink v%s" % l.get("version", "?"))
+            for i, (loc, inst, vals) in enumerate(functions):
+                if i not in used:
+                    yield 0, (inst, "pci-function (no NVML device)", addr(0, loc), details(vals))
+            for a in src.win_adapters() or []:
+                yield 0, ("adapter %s" % a.get("name"), "dxgi-adapter", a.get("luid") or na(""),
+                          "vendor 0x%04x device 0x%04x, dedicated video memory %s, shared system memory %s%s" % (
+                              a.get("vendor_id") or 0, a.get("device_id") or 0,
+                              human_size(a.get("dedicated_video_memory") or 0),
+                              human_size(a.get("shared_system_memory") or 0),
+                              ", software adapter" if a.get("software") else ""))
+        return TreeGrid([("Node", str), ("Kind", str), ("Address", str), ("Details", str)], rows())
 
     def _function(self, src, addr):
         base = "/sys/bus/pci/devices/" + addr
@@ -210,6 +300,8 @@ class DeviceTree(Plugin):
         src = self.ctx.live
         nv = src.nvml()
         devices = nv.get("devices", []) if nv.get("available") else []
+        if src.is_windows:
+            return self._windows(src, devices)
         pci_all = src.listdir("/sys/bus/pci/devices") or []
         nvidia_fns = [a for a in pci_all if (src.read_text("/sys/bus/pci/devices/%s/vendor" % a) or "").strip() == "0x10de"]
 
@@ -315,10 +407,53 @@ class Driver(Plugin):
                    "Windows driver-store libraries exposed in /usr/lib/wsl/lib with SHA-256.")
     METHOD = ("Reads /proc/driver/nvidia/version, /proc/driver/nvidia/gpus/*/information, /sys/module/nvidia/"
               "{version,srcversion}, hashes /lib/firmware/nvidia/<version>/* and /usr/lib/wsl/lib/*; NVML supplies "
-              "driver and CUDA versions.")
+              "driver and CUDA versions. On Windows: the NVIDIA display-class key (DriverDesc, DriverVersion, "
+              "DriverDate, InfPath, MatchingDeviceId), then nvlddmkm.sys (service ImagePath, loaded or not), the "
+              "other loaded NVIDIA kernel drivers (SystemModuleInformation) and the user-mode/API driver files the "
+              "registry names, each with file version, Authenticode status and SHA-256.")
     ANALOG = "windows.driverscan / windows.modules"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("no_hash", bool, False, "skip SHA-256 of firmware and driver-store files")]
+
+    def _windows(self, src, nv, sha):
+        def describe(path):
+            st = src.stat(path)
+            if st is None:
+                return na("%s: file not found" % path)
+            ver = src.win_file_version(path) or {}
+            return "%s (%s, version %s, %s; Authenticode %s)" % (
+                path, human_size(st.get("size") or 0), ver.get("file_version") or "?", ver.get("company") or "?",
+                _sig_text(src.win_signature(path)))
+
+        def rows():
+            if nv.get("available"):
+                yield 0, ("NVML driver version", str(nv.get("driver_version")), na(""))
+                yield 0, ("CUDA driver API version", str(nv.get("cuda_driver_version")), na(""))
+            keys = display_adapter_keys(src, nvidia_only=True)
+            if not keys:
+                yield 0, ("display driver", na("no NVIDIA display adapter in %s" % DISPLAY_CLASS), na(""))
+            for key, vals in keys:
+                yield 0, ("display driver", "%s (%s)" % (vals.get("DriverDesc") or "?", key), na(""))
+                for field in ("DriverVersion", "DriverDate", "ProviderName", "InfPath", "MatchingDeviceId"):
+                    if vals.get(field) is not None:
+                        yield 1, (field, str(vals[field]), na(""))
+            loaded = {(d.get("path") or "").lower() for d in src.win_drivers() or []}
+            files = win_driver_files(src)
+            kmd = next((p for role, p in files if role == "kernel-mode driver"), "")
+            if not kmd:
+                yield 0, ("kernel-mode driver", na("nvlddmkm service not registered (%s)" % NVLDDMKM_KEY), na(""))
+            for role, path in files:
+                if role == "kernel-mode driver":
+                    yield 0, ("kernel-mode driver (%s)" % ("loaded" if path.lower() in loaded else "NOT loaded"),
+                              describe(path), sha(path) if src.stat(path) else na(""))
+            for drv, _ver in win_kernel_drivers(src):
+                if drv.get("path", "").lower() != kmd.lower() and not drv.get("name", "").lower().startswith("dxg"):
+                    yield 0, ("kernel driver %s (loaded)" % drv.get("name"), describe(drv["path"]),
+                              sha(drv["path"]) if src.stat(drv["path"]) else na(""))
+            for role, path in files:
+                if role != "kernel-mode driver" and src.stat(path) is not None:
+                    yield 1, ("user-mode driver file (%s)" % role, describe(path), sha(path))
+        return TreeGrid([("Item", str), ("Value", str), ("SHA256", str)], rows())
 
     def run(self):
         src = self.ctx.live
@@ -326,6 +461,9 @@ class Driver(Plugin):
 
         def sha(path):
             return na("skipped") if self.opts["no_hash"] else (src.file_sha256(path) or na("unreadable"))
+
+        if src.is_windows:
+            return self._windows(src, nv, sha)
 
         def rows():
             ver = src.read_text("/proc/driver/nvidia/version")
@@ -382,12 +520,67 @@ class Modules(Plugin):
                    "depend on the NVIDIA driver (candidates for driver hooking).")
     METHOD = ("Parses /proc/modules (name, size, refcount, 'Used by', state, taint) and /sys/module/<name>/"
               "{version,srcversion,taint}; any dependent of an NVIDIA module not in the known NVIDIA set is "
-              "flagged. Built-in modules are detected through /sys/module.")
+              "flagged. Built-in modules are detected through /sys/module. On Windows: the loaded kernel drivers "
+              "(NtQuerySystemInformation SystemModuleInformation) that are NVIDIA's (driver store / company "
+              "NVIDIA) plus dxgkrnl/dxgmms, each with file version, Authenticode status and SHA-256 (flagged when "
+              "not validly signed by NVIDIA/Microsoft or loaded from outside System32), and the UpperFilters/"
+              "LowerFilters of the display adapter class and of the NVIDIA PCI devices (a filter driver sees the "
+              "GPU driver's I/O requests: the hooking analogue).")
     ANALOG = "windows.modules / linux.lsmod / linux.malware.check_modules"
     SOURCES = ("live",)
 
+    def _windows(self, src):
+        root = wgpu.system_root(src).lower() + "\\system32\\"
+        loaded = {(d.get("name") or "").lower(): d for d in src.win_drivers() or []}
+
+        def judge(path, sig):
+            why = []
+            if sig and sig.get("status") != "valid":
+                why.append("Authenticode: %s" % sig.get("status"))
+            elif sig and not re.search(r"nvidia|microsoft", sig.get("signer") or "", re.I):
+                why.append("signed by %r, not NVIDIA/Microsoft" % sig.get("signer"))
+            if path and not path.lower().startswith(root):
+                why.append("loaded from outside %s" % root.rstrip("\\"))
+            return why
+
+        def row(name, path, is_loaded, why):
+            st = src.stat(path) if path else None
+            ver = (src.win_file_version(path) or {}) if st else {}
+            sig = src.win_signature(path) if st else None
+            why = why + judge(path, sig) if st else why + ["driver file not found"]
+            return (name, path or na("no ImagePath"), is_loaded, ver.get("file_version") or na(""),
+                    ver.get("company") or na(""), _sig_text(sig), (src.file_sha256(path) or na("unreadable")) if st
+                    else na(""), bool(why), "; ".join(why))
+
+        def rows():
+            for drv, _ver in win_kernel_drivers(src):
+                yield 0, row(drv.get("name"), drv.get("path"), True, [])
+            filters = []
+            cls = (src.registry_key(DISPLAY_CLASS) or {}).get("values") or {}
+            for kind in ("UpperFilters", "LowerFilters"):
+                filters += [(f, "display adapter class %s" % kind) for f in cls.get(kind) or []]
+            for dev in (src.registry_key(ENUM_PCI_KEY) or {}).get("subkeys", []):
+                if dev.upper().startswith("VEN_10DE"):
+                    for inst in (src.registry_key(ENUM_PCI_KEY + "\\" + dev) or {}).get("subkeys", []):
+                        vals = (src.registry_key("%s\\%s\\%s" % (ENUM_PCI_KEY, dev, inst)) or {}).get("values") or {}
+                        for kind in ("UpperFilters", "LowerFilters"):
+                            filters += [(f, "NVIDIA device %s %s" % (dev, kind)) for f in vals.get(kind) or []]
+            for name, where in filters:
+                image = ((src.registry_key(SERVICES_KEY + "\\" + name) or {}).get("values") or {}).get("ImagePath")
+                path = wgpu.win_path(src, str(image)) if image else ""
+                yield 0, row(name, path, wgpu.basename(path).lower() in loaded,
+                             ["%s filter driver: sees every I/O request to the GPU driver (driver hooking analogue)"
+                              % where])
+            if not filters:
+                yield 0, ("display filters", DISPLAY_CLASS, False, na(""), na(""), na(""), na(""), False,
+                          "no UpperFilters/LowerFilters on the display adapter class or the NVIDIA PCI devices")
+        return TreeGrid([("Module", str), ("Path", str), ("Loaded", bool), ("Version", str), ("Company", str),
+                         ("Signature", str), ("SHA256", str), ("Suspicious", bool), ("Reason", str)], rows())
+
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
         require_linux(src, self.NAME)
         text = src.read_text("/proc/modules")
 
@@ -453,6 +646,12 @@ class DevNodes(Plugin):
 
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            raise UnsupportedError(
+                "nvidia.devnodes checks Linux /dev/nvidia* and /dev/dxg character-device nodes; Windows has no such "
+                "nodes (applications reach the GPU through \\Device\\DxgKrnl and the display driver). Run "
+                "nvidia.modules (NVIDIA kernel drivers, their signatures and display-class filter drivers) and "
+                "nvidia.devicetree on Windows, and nvidia.devnodes inside WSL2/Linux")
         require_linux(src, self.NAME)
         paths = ["/dev/" + n for n in (src.listdir("/dev") or []) if NODE_RE.match(n)]
         paths += ["/dev/nvidia-caps/" + n for n in (src.listdir("/dev/nvidia-caps") or [])]
@@ -484,7 +683,8 @@ class DevNodes(Plugin):
                     sus = True
                     notes.append("capability node accessible to all users")
                 elif mode & 0o002 and st["is_char"]:
-                    notes.append("world-accessible (driver default DeviceFileMode=0666)")
+                    notes.append("world-accessible (dxgkrnl default on WSL2)" if name == "dxg" else
+                                 "world-accessible (driver default DeviceFileMode=0666)")
                 yield 0, (path, kind, st.get("rdev_major", na("-")), st.get("rdev_minor", na("-")), st["perm"],
                           st["uid"], st["gid"], sus, "; ".join(notes))
         return TreeGrid([("Node", str), ("Type", str), ("Major", int), ("Minor", int), ("Mode", str), ("UID", int),
@@ -508,7 +708,24 @@ PARAM_RULES = {
     "EnableGpuFirmware": lambda v: ("info", "GSP firmware disabled") if v == "0" else ("info", ""),
     "RegistryDwords": lambda v: ("info", "RM registry overrides present") if v.strip('"') else ("info", ""),
     "NVreg_RegistryDwords": lambda v: ("info", "RM registry overrides present") if v.strip('"') else ("info", ""),
+    # Windows: Microsoft "Timeout Detection and Recovery (TDR) registry keys"
+    "TdrLevel": lambda v: ("high", "GPU timeout detection disabled (TdrLevelOff): kernels can run indefinitely")
+    if v == "0" else ("info", ""),
+    "TdrDebugMode": lambda v: ("high", "GPU timeouts ignored (TdrDebugMode=1)") if v == "1" else ("info", ""),
+    "TdrDelay": lambda v: ("medium", "long GPU timeout (%s s)" % v) if v.isdigit() and int(v) > 10 else ("info", ""),
+    "TdrDdiDelay": lambda v: ("medium", "long GPU timeout (%s s)" % v) if v.isdigit() and int(v) > 10 else ("info", ""),
 }
+TDR_VALUES = ("TdrLevel", "TdrDelay", "TdrDdiDelay", "TdrDebugMode", "TdrLimitTime", "TdrLimitCount")
+WIN_PARAM_KEYS = (NVLDDMKM_KEY, NVLDDMKM_KEY + r"\Parameters", NVLDDMKM_KEY + r"\Global\NVTweak",
+                  NVLDDMKM_KEY + r"\Parameters\Global\NVTweak")
+
+
+def _reg_text(v) -> str:
+    if isinstance(v, dict) and "binary" in v:
+        return "binary (%d bytes)" % v.get("size", 0)
+    if isinstance(v, list):
+        return "; ".join(map(str, v))
+    return str(v)
 
 
 class Params(Plugin):
@@ -517,14 +734,49 @@ class Params(Plugin):
     DESCRIPTION = ("Prints the NVIDIA driver's runtime parameters and NVreg_* module options from modprobe "
                    "configuration, flagging security-relevant settings (profiling restriction, memory zeroing, "
                    "device-node permissions, registry overrides).")
-    METHOD = "Parses /proc/driver/nvidia/params ('Key: value') and 'options nvidia NVreg_*' lines in %s." % \
-             ", ".join(MODPROBE_DIRS)
+    METHOD = ("Parses /proc/driver/nvidia/params ('Key: value') and 'options nvidia NVreg_*' lines in %s. On "
+              "Windows: the values of the nvlddmkm service key, its Parameters and Global\\NVTweak subkeys, the "
+              "RM* values of the NVIDIA display-class key (RmProfilingAdminOnly reported even when unset) and the "
+              "TDR values under HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers." % ", ".join(MODPROBE_DIRS))
     ANALOG = "windows.registry.printkey"
     SOURCES = ("live",)
     REQUIREMENTS = [Requirement("flagged_only", bool, False, "only parameters with a finding")]
 
+    def _windows(self, src):
+        def judge(name, value):
+            return PARAM_RULES.get(name, lambda _v: ("info", ""))(_reg_text(value))
+
+        def rows():
+            if src.registry_key(NVLDDMKM_KEY) is None:
+                yield 0, (NVLDDMKM_KEY, na("not present"), "", "info", "no NVIDIA display driver installed")
+            entries = []
+            for key in WIN_PARAM_KEYS:
+                vals = (src.registry_key(key) or {}).get("values") or {}
+                entries += [(key, k, vals[k]) for k in sorted(vals)]
+            for key, vals in display_adapter_keys(src, nvidia_only=True):
+                entries += [(key, k, vals[k]) for k in sorted(vals) if k.lower().startswith("rm")]
+            if not win_rm_profiling(src):
+                entries.append(("registry (default)", "RmProfilingAdminOnly", None))
+            tdr = (src.registry_key(GRAPHICS_DRIVERS_KEY) or {}).get("values") or {}
+            entries += [(GRAPHICS_DRIVERS_KEY, k, tdr.get(k)) for k in TDR_VALUES]
+            for key, name, value in entries:
+                if value is None:
+                    sev, note = "info", ("not set: profiling restricted to administrators (driver default since "
+                                         "R419.67)" if name == "RmProfilingAdminOnly" else "not set (default)")
+                    if self.opts["flagged_only"]:
+                        continue
+                    yield 0, (key, name, na("not set"), sev, note)
+                    continue
+                sev, note = judge(name, value)
+                if self.opts["flagged_only"] and not note:
+                    continue
+                yield 0, (key, name, _reg_text(value), sev, note)
+        return TreeGrid([("Source", str), ("Parameter", str), ("Value", str), ("Severity", str), ("Note", str)], rows())
+
     def run(self):
         src = self.ctx.live
+        if src.is_windows:
+            return self._windows(src)
         require_linux(src, self.NAME)
         params = read_params(src)
 
@@ -547,11 +799,50 @@ class Params(Plugin):
         return TreeGrid([("Source", str), ("Parameter", str), ("Value", str), ("Severity", str), ("Note", str)], rows())
 
 
+MAX_LOG = 256 << 20  # decompressed size accepted for a log file / bug report
+
+
+def time_note(e) -> str:
+    """Say how an Xid event's time was obtained when the log line did not fully specify it."""
+    raw = e.get("raw", "")
+    if not e.get("time"):
+        return ""
+    if xid_ind.SYSLOG_TS_RE.match(raw):
+        return ("syslog time has no year or zone: year from the log's modification time / report date; shown as "
+                "logged (the logging host's local time, zone unknown)")
+    m = xid_ind.ISO_TS_RE.match(raw)
+    if m and not m.group(3):
+        return "log time has no UTC offset: shown as logged (the logging host's local time, zone unknown)"
+    return ""
+
+
+def event_time(e) -> str:
+    """An Xid event's time as text: ISO UTC, or boot-relative when only the dmesg offset is known."""
+    if e.get("time"):
+        return e["time"].isoformat()
+    m = xid_ind.DMESG_TS_RE.match(e.get("raw", ""))
+    return "boot+%ss" % m.group(1) if m else "no timestamp"
+
+
 def _open_log(path: str) -> List[str]:
-    with open(path, "rb") as fh:
-        raw = fh.read()
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
+    """Lines of a plain or gzip-compressed log, decompressed incrementally with a size limit (a gzip bomb stops at
+    MAX_LOG). Missing/unreadable files raise RequirementError, damaged or oversized ones FormatError."""
+    try:
+        with open(path, "rb") as fh:
+            gz = fh.read(2) == b"\x1f\x8b"
+            fh.seek(0)
+            if gz:
+                with gzip.GzipFile(fileobj=fh) as g:
+                    raw = g.read(MAX_LOG + 1)
+            else:
+                raw = fh.read(MAX_LOG + 1)
+    except (EOFError, zlib.error, gzip.BadGzipFile) as exc:
+        raise FormatError("%s is not a valid or complete gzip file (%s)" % (path, exc))
+    except OSError as exc:
+        raise RequirementError("cannot read %s: %s" % (path, exc.strerror or exc))
+    if len(raw) > MAX_LOG:
+        raise FormatError("%s is larger than %d MiB%s; split it or extract the relevant part"
+                          % (path, MAX_LOG >> 20, " when decompressed" if gz else ""))
     return raw.decode("utf-8", "replace").splitlines()
 
 
@@ -562,16 +853,36 @@ class Xid(Plugin, TimeLinerInterface):
                    "access type, engine exceptions, falling off the bus, ECC events...) with time, PID and process.")
     METHOD = ("Parses 'NVRM: Xid (PCI:...): <code>, pid=..., name=..., <message>' lines from journalctl -k "
               "(-o short-iso) or dmesg (boot-relative time converted with /proc/stat btime), or from --log-file "
-              "(plain or .gz); codes are named from the built-in Xid catalogue.")
+              "(plain or .gz, decompressed with a 256 MiB limit); codes are named from the built-in Xid catalogue. "
+              "Syslog lines carry no year: it is taken from the log file's modification time (a date after it "
+              "belongs to the previous year). Times without a UTC offset are taken as UTC and say so in the "
+              "Forensic note.")
     ANALOG = "linux.kmsg / windows.crashinfo"
     SOURCES = ("file",)
     REQUIREMENTS = [Requirement("log_file", str, None, "kernel log / syslog / dmesg capture to parse instead of the "
                                                         "live system"),
                     Requirement("code", int, None, "only this Xid code")]
 
+    @staticmethod
+    def _file_events(path):
+        lines = _open_log(path)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = None
+        year = _dt.datetime.fromtimestamp(mtime, tz=_dt.timezone.utc).year if mtime else None
+        events = xid_ind.parse_log(lines, None, year)
+        for e in events:
+            if e["time"] and mtime and xid_ind.SYSLOG_TS_RE.match(e["raw"]) and e["time"].timestamp() > mtime + 86400:
+                try:
+                    e["time"] = e["time"].replace(year=e["time"].year - 1)  # Dec entries in a January-modified log
+                except ValueError:
+                    pass
+        return events
+
     def _events(self):
         if self.opts.get("log_file"):
-            return xid_ind.parse_log(_open_log(self.opts["log_file"]), None, None), "file %s" % self.opts["log_file"]
+            return self._file_events(self.opts["log_file"]), "file %s" % self.opts["log_file"]
         if not self.ctx.has_live():
             raise RequirementError("nvidia.xid needs --log-file or a live/snapshot source (--live)")
         src = self.ctx.live
@@ -595,9 +906,10 @@ class Xid(Plugin, TimeLinerInterface):
             for e in events:
                 if self.opts["code"] is not None and e["code"] != self.opts["code"]:
                     continue
+                note = "; ".join(x for x in (e["forensic"], time_note(e)) if x)
                 yield 0, (e["time"] or na("no timestamp"), e["pci"], e["code"],
                           e["name"] + ("" if e["certain"] else " (?)"), e["pid"] if e["pid"] is not None else na("-"),
-                          e["process"], e["details"], e["forensic"])
+                          e["process"], e["details"], note)
         return TreeGrid([("Time", object), ("PCI", str), ("Xid", int), ("Name", str), ("PID", int), ("Process", str),
                          ("Details", str), ("Forensic note", str)], rows())
 
@@ -615,9 +927,10 @@ class BugReport(Plugin):
     DESCRIPTION = ("Extracts forensic facts from an nvidia-bug-report.log(.gz): collection date, kernel, driver "
                    "and CUDA versions, every GPU (name, UUID, bus, VBIOS), Xid events and the list of captured "
                    "sections.")
-    METHOD = ("Reads the (optionally gzip-compressed) report; parses 'NVRM version', 'uname', nvidia-smi -q "
-              "'Product Name / GPU UUID / VBIOS Version' blocks, '*** <section>' headers and Xid lines with the "
-              "Xid decoder.")
+    METHOD = ("Reads the (optionally gzip-compressed, 256 MiB limit) report; parses 'NVRM version', 'uname', "
+              "nvidia-smi -q 'Product Name / GPU UUID / VBIOS Version' blocks, '*** <section>' headers and Xid lines "
+              "with the Xid decoder (syslog dates take the year of the report's start line; dmesg times without "
+              "the boot time are shown boot-relative).")
     ANALOG = "windows.crashinfo"
     SOURCES = ("file",)
     REQUIREMENTS = [Requirement("file", str, None, "path to nvidia-bug-report.log or .log.gz")]
@@ -651,9 +964,11 @@ class BugReport(Plugin):
                              line)
                 if m and gpu:
                     yield 1, ("gpu", "%s %s" % (gpu, m.group(1)), m.group(2).strip())
-            for e in xid_ind.parse_log(lines):
-                yield 0, ("xid", "Xid %d %s" % (e["code"], e["name"]), "pid=%s %s %s" % (e["pid"], e["process"],
-                                                                                        e["details"]))
+            started = first(r"Start of NVIDIA bug report log file\.\s*(.*)$") or ""
+            year = re.search(r"\b(\d{4})\s*$", started)
+            for e in xid_ind.parse_log(lines, None, int(year.group(1)) if year else None):
+                yield 0, ("xid", "Xid %d %s" % (e["code"], e["name"]), "time=%s pid=%s %s %s" % (
+                    event_time(e), e["pid"] if e["pid"] is not None else "-", e["process"], e["details"]))
             sections = [l[4:].strip() for l in lines if l.startswith("*** ")]
             yield 0, ("report", "sections", "%d: %s" % (len(sections), "; ".join(sections[:40])))
         return TreeGrid([("Category", str), ("Item", str), ("Value", str)], rows())

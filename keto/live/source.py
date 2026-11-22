@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
 import stat as _stat
 import subprocess
@@ -30,13 +31,100 @@ ENV_KEEP_PREFIXES = ("CUDA_", "NV", "NVIDIA_", "__GL_", "__NV", "LD_", "OPENCL",
                      "TF_", "XLA_", "TORCH_", "CUPY_", "NCCL_", "CUPTI", "DXG", "DISPLAY", "WAYLAND_DISPLAY",
                      "XDG_SESSION_TYPE", "KUBERNETES_", "DOCKER_", "container", "SINGULARITY", "APPTAINER")
 ENV_KEEP_EXACT = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "SUDO_USER", "SUDO_COMMAND", "SSH_CONNECTION"}
-ALLOWED_COMMANDS = {"dpkg", "dpkg-query", "rpm", "modinfo", "dmesg", "journalctl", "nvidia-smi", "systemctl", "lspci",
-                    "uname", "debsums", "sha256sum", "lsmod"}
 MAX_TEXT = 4 << 20
+
+#: programs are resolved only in these directories, never through the caller's PATH
+SAFE_PATH = os.pathsep.join(("/usr/sbin", "/usr/bin", "/sbin", "/bin"))
+_PKG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._:~@-]*$")
+_ANY_OPERAND = re.compile(r"^[^-]")
+#: The read-only command allow list: program -> argument rules. ``flags`` stand alone, ``valued`` take a value
+#: (next argument or ``--flag=value``), ``operands`` is the pattern for non-option arguments (None: none allowed),
+#: ``require`` lists flags of which one must be present (the read-only mode of a program that can also write).
+ALLOWED_COMMANDS: Dict[str, dict] = {
+    "dpkg-query": {"flags": {"-W", "--show", "-l", "--list", "-s", "--status", "-L", "--listfiles"},
+                   "valued": {"-f", "--showformat"}, "operands": _PKG_NAME,
+                   "require": {"-W", "--show", "-l", "--list", "-s", "--status", "-L", "--listfiles"}},
+    "dpkg": {"flags": {"-V", "--verify", "-l", "--list", "-s", "--status", "-L", "--listfiles"},
+             "valued": {"--verify-format"}, "operands": _PKG_NAME,
+             "require": {"-V", "--verify", "-l", "--list", "-s", "--status", "-L", "--listfiles"}},
+    "rpm": {"flags": {"-q", "--query", "-qa", "-a", "--all", "-V", "--verify", "-Va"},
+            "valued": {"--qf", "--queryformat"}, "operands": _PKG_NAME,
+            "require": {"-q", "--query", "-qa", "-V", "--verify", "-Va"}},
+    "journalctl": {"flags": {"-k", "--dmesg", "--no-pager", "-q", "--quiet", "--utc", "-a", "--all"},
+                   "valued": {"-o", "--output", "-b", "--boot", "--since", "--until", "-n", "--lines"},
+                   "operands": None},
+    "dmesg": {"flags": {"-T", "--ctime", "-t", "--notime", "-x", "--decode", "-k", "--kernel", "-r", "--raw",
+                        "--color=never", "-P", "--nopager"},
+              "valued": {"--time-format"}, "operands": None},
+    "modinfo": {"flags": {"-a", "-d", "-l", "-p", "-n", "-0", "--author", "--description", "--license",
+                          "--parameters", "--filename", "--null"},
+                "valued": {"-F", "--field", "-k", "-b", "--basedir"}, "operands": _PKG_NAME},
+    "nvidia-smi": {"flags": {"-q", "--query", "-x", "--xml-format", "-L", "--list-gpus"},
+                   "valued": {"-i", "--id", "-d", "--display", "--query-gpu", "--query-compute-apps",
+                              "--query-accounted-apps", "--query-retired-pages", "--query-remapped-rows", "--format"},
+                   "operands": None},
+    "systemctl": {"flags": {"--no-pager", "-a", "--all", "--plain", "--no-legend", "--full", "-l"},
+                  "valued": {"-p", "--property", "-t", "--type", "--state"},
+                  "verbs": {"status", "show", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files",
+                            "cat", "list-dependencies"}, "operands": _PKG_NAME},
+    "lspci": {"flags": {"-v", "-vv", "-n", "-nn", "-k", "-D", "-mm", "-m", "-t"}, "valued": {"-s", "-d"},
+              "operands": None},
+    "uname": {"flags": {"-a", "--all", "-r", "--kernel-release", "-s", "--kernel-name", "-v", "--kernel-version",
+                        "-m", "--machine", "-n", "-p", "-i", "-o"}, "valued": set(), "operands": None},
+    "debsums": {"flags": {"-s", "--silent", "-c", "--changed", "-a", "--all", "-e", "--config", "-l",
+                          "--list-missing"}, "valued": set(), "operands": _PKG_NAME},
+    "sha256sum": {"flags": {"-b", "--binary", "-t", "--text", "--tag", "-z", "--zero"}, "valued": set(),
+                  "operands": _ANY_OPERAND},
+    "lsmod": {"flags": set(), "valued": set(), "operands": None},
+}
+
+
+def check_command(argv: List[str]) -> str:
+    """Validate ``argv`` against the read-only allow list; return the program name. ``argv[0]`` must be a bare
+    allow-listed name (it is resolved in SAFE_PATH, never through PATH) and every argument must be one the rules
+    permit, so a write/reset mode of an allowed program (``dmesg -C``, ``dpkg -i``, ``nvidia-smi -r``,
+    ``systemctl stop``) is refused. Raises LiveSourceError."""
+    if not argv:
+        raise LiveSourceError("empty command")
+    prog = argv[0]
+    rules = ALLOWED_COMMANDS.get(prog)
+    if rules is None:
+        raise LiveSourceError("command %r is not on the read-only allow list" % (argv[:1],))
+    args = list(argv[1:])
+    verbs = rules.get("verbs")
+    if verbs is not None and args and not args[0].startswith("-"):
+        if args[0] not in verbs:
+            raise LiveSourceError("%s %s is not a read-only operation" % (prog, args[0]))
+        args = args[1:]
+    seen, i = set(), 0
+    while i < len(args):
+        a = args[i]
+        name = a.split("=", 1)[0] if a.startswith("--") or (a.startswith("-") and "=" in a) else a
+        if a in rules["flags"]:
+            seen.add(a)
+        elif name in rules["valued"]:
+            seen.add(name)
+            if name == a:  # value in the next argument
+                i += 1
+                if i >= len(args):
+                    raise LiveSourceError("%s %s needs a value" % (prog, a))
+        elif not a.startswith("-") and rules["operands"] is not None and rules["operands"].match(a):
+            pass
+        else:
+            raise LiveSourceError("argument %r of %s is not on the read-only allow list" % (a, prog))
+        i += 1
+    if rules.get("require") and not seen & rules["require"]:
+        raise LiveSourceError("%s is only allowed in a read-only mode (%s)" % (prog, ", ".join(sorted(rules["require"]))))
+    return prog
 
 
 def keep_env(key: str) -> bool:
     return key in ENV_KEEP_EXACT or key.startswith(ENV_KEEP_PREFIXES)
+
+
+class NotRecordedError(LiveSourceError):
+    """A replayed query the snapshot does not contain (typically a plugin run with options other than the
+    defaults used while the snapshot was recorded)."""
 
 
 class LiveSource:
@@ -56,11 +144,23 @@ class LiveSource:
     def proc_mem(self, pid: int, address: int, length: int) -> Optional[bytes]: ...
     def file_sha256(self, path: str) -> Optional[str]: ...
     def registry(self, key: str, name: str) -> Optional[Any]: ...  # HKLM value on Windows, else None
+    #: ``{"values": {name: value}, "subkeys": [...]}`` of ``HKLM\\...``/``HKCU\\...`` (None when absent/not Windows)
+    def registry_key(self, path: str) -> Optional[Dict[str, Any]]: return None
     # Windows process view (empty/None elsewhere)
     def win_processes(self) -> List[Dict[str, Any]]: return []
     def win_modules(self, pid: int) -> Optional[List[Dict[str, Any]]]: return None
     def win_windowed(self) -> List[int]: return []
     def win_gpu(self) -> Dict[str, Any]: return {"available": False, "processes": {}}
+    def win_adapters(self) -> List[Dict[str, Any]]: return []
+    def win_cmdline(self, pid: int) -> Optional[str]: return None
+    def win_signature(self, path: str) -> Optional[Dict[str, Any]]: return None
+    #: PEB environment (reduced by keep_env), PEB ImagePathName and ProcessDebugPort of a process
+    def win_process_info(self, pid: int) -> Optional[Dict[str, Any]]: return None
+    def win_drivers(self) -> List[Dict[str, Any]]: return []           # loaded kernel modules
+    def win_file_version(self, path: str) -> Optional[Dict[str, Any]]: return None
+    def win_regions(self, pid: int) -> Optional[List[Dict[str, Any]]]: return None  # VirtualQueryEx regions
+    #: GPU-related open handles of a process (``{"handles": [...], "file_handles", "unresolved"}``; None: unreadable)
+    def win_handles(self, pid: int) -> Optional[Dict[str, Any]]: return None
     def now(self) -> float: ...
 
     # convenience built on the primitives (identical for every implementation)
@@ -72,6 +172,10 @@ class LiveSource:
     @property
     def is_linux(self) -> bool:
         return (self.platform() or {}).get("system") == "Linux"
+
+    @property
+    def is_windows(self) -> bool:
+        return (self.platform() or {}).get("system") == "Windows"
 
     @property
     def is_wsl(self) -> bool:
@@ -90,6 +194,8 @@ class SystemSource(LiveSource):
         info = {"system": platform.system(), "release": platform.release(), "version": platform.version(),
                 "machine": platform.machine(), "python": platform.python_version(), "hostname": socket.gethostname(),
                 "self_pid": os.getpid()}
+        if os.name == "nt":
+            info["system_root"] = os.environ.get("SystemRoot", r"C:\Windows")
         try:
             with open("/proc/version") as fh:
                 pv = fh.read()
@@ -228,16 +334,21 @@ class SystemSource(LiveSource):
                 "cgroup": (self.read_text(base + "/cgroup") or "").strip()}
 
     def command(self, argv, timeout=30):
-        if not argv or os.path.basename(argv[0]) not in ALLOWED_COMMANDS:
-            raise LiveSourceError("command %r is not on the read-only allow list" % (argv[:1],))
+        prog = check_command(argv)
+        exe = shutil.which(prog, path=SAFE_PATH)
+        if exe is None:
+            return {"rc": None, "stdout": "", "stderr": "%s not found in %s" % (prog, SAFE_PATH)}
         try:
-            p = subprocess.run(argv, capture_output=True, timeout=timeout)
+            p = subprocess.run([exe] + list(argv[1:]), capture_output=True, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"rc": None, "stdout": "", "stderr": str(exc)}
         return {"rc": p.returncode, "stdout": p.stdout[:MAX_TEXT].decode("utf-8", "replace"),
                 "stderr": p.stderr[:65536].decode("utf-8", "replace")}
 
     def proc_mem(self, pid, address, length):
+        w = self._win()
+        if w:
+            return w.read_memory(pid, address, length)
         try:
             with open("/proc/%d/mem" % pid, "rb") as fh:
                 fh.seek(address)
@@ -273,6 +384,9 @@ class SystemSource(LiveSource):
         if os.name != "nt":
             return None
         from keto.live import windows
+        if not getattr(self, "_win_priv", False):
+            self._win_priv = True
+            self.win_debug_privilege = windows.enable_debug_privilege()
         return windows
 
     def win_processes(self):
@@ -294,6 +408,52 @@ class SystemSource(LiveSource):
         if getattr(self, "_win_gpu", None) is None:
             self._win_gpu = w.gpu_counters()
         return self._win_gpu
+
+    def win_adapters(self):
+        w = self._win()
+        return w.adapters() if w else []
+
+    def win_cmdline(self, pid):
+        w = self._win()
+        return w.command_line(pid) if w else None
+
+    def win_signature(self, path):
+        w = self._win()
+        if not w or not path:
+            return None
+        cache = self.__dict__.setdefault("_sig_cache", {})
+        key = path.lower()
+        if key not in cache:
+            cache[key] = w.signature(path)
+        return cache[key]
+
+    def registry_key(self, path):
+        w = self._win()
+        return w.registry_key(path) if w else None
+
+    def win_process_info(self, pid):
+        w = self._win()
+        return w.process_info(pid, keep_env) if w else None
+
+    def win_drivers(self):
+        w = self._win()
+        return w.drivers() if w else []
+
+    def win_file_version(self, path):
+        w = self._win()
+        return w.file_version(path) if w and path else None
+
+    def win_regions(self, pid):
+        w = self._win()
+        return w.memory_regions(pid) if w else None
+
+    def win_handles(self, pid):
+        w = self._win()
+        if not w:
+            return None
+        if getattr(self, "_handle_table", None) is None:  # one handle-table snapshot per source (per run)
+            self._handle_table = w.HandleTable()
+        return self._handle_table.gpu_handles(pid)
 
     def now(self):
         return time.time()
@@ -349,6 +509,15 @@ class RecordingSource(LiveSource):
     def win_modules(self, pid): return self._rec("win_modules", pid)
     def win_windowed(self): return self._rec("win_windowed")
     def win_gpu(self): return self._rec("win_gpu")
+    def win_adapters(self): return self._rec("win_adapters")
+    def win_cmdline(self, pid): return self._rec("win_cmdline", pid)
+    def win_signature(self, path): return self._rec("win_signature", path)
+    def registry_key(self, path): return self._rec("registry_key", path)
+    def win_process_info(self, pid): return self._rec("win_process_info", pid)
+    def win_drivers(self): return self._rec("win_drivers")
+    def win_file_version(self, path): return self._rec("win_file_version", path)
+    def win_regions(self, pid): return self._rec("win_regions", pid)
+    def win_handles(self, pid): return self._rec("win_handles", pid)
 
     def now(self):
         return self._rec("now")
@@ -358,7 +527,8 @@ class RecordingSource(LiveSource):
 
 
 class ReplaySource(LiveSource):
-    """Answer live queries from a recorded snapshot."""
+    """Answer live queries from a recorded snapshot. A query the snapshot does not contain raises
+    NotRecordedError (it is also listed in ``misses``): replay never invents an empty answer."""
 
     kind = "snapshot"
 
@@ -369,32 +539,51 @@ class ReplaySource(LiveSource):
         self.created = snapshot.get("created")
         self.misses: List[str] = []
 
-    def _get(self, method, *args, default=None):
+    def _get(self, method, *args):
         k = _key(method, list(args))
         if k in self.records:
             return _decode(self.records[k])
         self.misses.append(k)
-        return default
+        raise NotRecordedError("not recorded in snapshot: %s%s (the snapshot holds what the live plugins queried "
+                               "with their default options; re-run with those options, or on the live system)"
+                               % (method, json.dumps(list(args), default=str)[:200]))
 
-    def platform(self): return self._get("platform", default={})
-    def nvml(self): return self._get("nvml", default={"available": False, "error": "not in snapshot", "devices": []})
-    def cuda(self): return self._get("cuda", default={"available": False, "error": "not in snapshot"})
+    def platform(self): return self._get("platform")
+    def nvml(self): return self._get("nvml")
+    def cuda(self): return self._get("cuda")
     def read_text(self, path, limit=MAX_TEXT): return self._get("read_text", path, limit)
     def read_bytes(self, path, limit=MAX_TEXT): return self._get("read_bytes", path, limit)
     def listdir(self, path): return self._get("listdir", path)
     def readlink(self, path): return self._get("readlink", path)
     def stat(self, path): return self._get("stat", path)
-    def pids(self): return self._get("pids", default=[])
+    def pids(self): return self._get("pids")
     def proc(self, pid): return self._get("proc", pid)
-    def command(self, argv, timeout=30): return self._get("command", list(argv), timeout)
+
+    def command(self, argv, timeout=30):
+        check_command(argv)
+        return self._get("command", list(argv), timeout)
+
     def proc_mem(self, pid, address, length): return self._get("proc_mem", pid, address, length)
     def file_sha256(self, path): return self._get("file_sha256", path)
 
     def registry(self, key, name): return self._get("registry", key, name)
-    def win_processes(self): return self._get("win_processes", default=[])
+    def registry_key(self, path): return self._get("registry_key", path)
+    def win_processes(self): return self._get("win_processes")
     def win_modules(self, pid): return self._get("win_modules", pid)
-    def win_windowed(self): return self._get("win_windowed", default=[])
-    def win_gpu(self): return self._get("win_gpu", default={"available": False, "processes": {}})
+    def win_windowed(self): return self._get("win_windowed")
+    def win_gpu(self): return self._get("win_gpu")
+    def win_adapters(self): return self._get("win_adapters")
+    def win_cmdline(self, pid): return self._get("win_cmdline", pid)
+    def win_signature(self, path): return self._get("win_signature", path)
+    def win_process_info(self, pid): return self._get("win_process_info", pid)
+    def win_drivers(self): return self._get("win_drivers")
+    def win_file_version(self, path): return self._get("win_file_version", path)
+    def win_regions(self, pid): return self._get("win_regions", pid)
+    def win_handles(self, pid): return self._get("win_handles", pid)
 
     def now(self):
-        return self._get("now", default=self.created or 0.0)
+        try:
+            return self._get("now")
+        except NotRecordedError:
+            self.misses.pop()
+            return self.created or 0.0  # older snapshots: the recording time is the observation time

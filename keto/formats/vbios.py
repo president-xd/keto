@@ -21,10 +21,12 @@ BIT_SIG = b"\xff\xb8BIT\x00"
 
 class RomImage:
     def __init__(self, offset: int, length: int, vendor: int, device: int, class_code: int, code_type: int,
-                 last: bool, revision: int, checksum_ok: Optional[bool]):
+                 last: bool, revision: int, checksum_ok: Optional[bool], pcir: int = 0, pcir_length: int = 0x18,
+                 header_size: int = 0):
         self.offset, self.length, self.vendor, self.device = offset, length, vendor, device
         self.class_code, self.code_type, self.last, self.revision = class_code, code_type, last, revision
         self.checksum_ok = checksum_ok
+        self.pcir, self.pcir_length, self.header_size = pcir, pcir_length, header_size
 
     @property
     def code_type_name(self):
@@ -38,6 +40,7 @@ def parse_image(data: bytes, off: int) -> Optional[RomImage]:
     if pcir + 0x18 > len(data) or data[pcir:pcir + 4] != b"PCIR":
         return None
     vendor, device = struct.unpack_from("<HH", data, pcir + 4)
+    pcir_length = struct.unpack_from("<H", data, pcir + 0x0A)[0]
     revision = data[pcir + 0x0C]
     class_code = data[pcir + 0x0D] | (data[pcir + 0x0E] << 8) | (data[pcir + 0x0F] << 16)
     length = struct.unpack_from("<H", data, pcir + 0x10)[0] * 512
@@ -46,7 +49,8 @@ def parse_image(data: bytes, off: int) -> Optional[RomImage]:
     checksum_ok = None
     if code_type == 0 and length and off + length <= len(data):
         checksum_ok = sum(data[off:off + length]) % 256 == 0
-    return RomImage(off, length, vendor, device, class_code, code_type, last, revision, checksum_ok)
+    return RomImage(off, length, vendor, device, class_code, code_type, last, revision, checksum_ok,
+                    pcir - off, pcir_length, data[off + 2] * 512)
 
 
 def parse_chain(data: bytes, off: int, max_images: int = 8) -> List[RomImage]:
@@ -109,6 +113,108 @@ def rom_strings(data: bytes, limit: int = 40) -> List[str]:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+#: the sign-on banner of NVIDIA ROMs repeats the BIT version ("Version 95.07.2D.00.5F")
+SIGNON_VERSION_RE = re.compile(rb"Version ([0-9A-Fa-f]{2}(?:\.[0-9A-Fa-f]{2}){4})\b")
+
+
+def anomalies(rom: bytes, chain: List[RomImage], available: int, max_images: int = 8) -> List[str]:
+    """Structural inconsistencies of an option-ROM image chain. ``rom`` holds the chain from its first image;
+    ``available`` is how many bytes of memory exist from there (an image may not extend past it)."""
+    out = []
+    first = chain[0]
+    for i, img in enumerate(chain):
+        if not img.length:
+            out.append("chain: image %d has length 0" % i)
+        elif img.offset + img.length > available:
+            out.append("chain: image %d (%d bytes) extends past the end of memory" % (i, img.length))
+        if (img.length and img.pcir + 0x18 > img.length) or img.pcir_length < 0x18 or img.revision not in (0, 3):
+            out.append("chain: image %d PCIR malformed (at +0x%x, length 0x%x, revision %d)"
+                       % (i, img.pcir, img.pcir_length, img.revision))
+        if img.code_type == 0 and img.length and img.header_size != img.length:
+            out.append("chain: image %d header size %d != PCIR image length %d" % (i, img.header_size, img.length))
+        if img.checksum_ok is False:
+            out.append("checksum BAD in image %d" % i)
+        if img.vendor != first.vendor:
+            out.append("vendor mismatch: image %d is %04x:%04x, image 0 %04x:%04x"
+                       % (i, img.vendor, img.device, first.vendor, first.device))
+        elif img.device != first.device:
+            out.append("device mismatch: image %d is %04x:%04x, image 0 %04x:%04x"
+                       % (i, img.vendor, img.device, first.vendor, first.device))
+    if not chain[-1].last and chain[-1].length:
+        out.append("chain: %s" % ("more than %d images" % max_images if len(chain) >= max_images else
+                                  "image %d is not flagged last but no valid image follows" % (len(chain) - 1)))
+    bpos = rom.find(BIT_SIG)
+    bit = parse_bit(rom, bpos) if bpos >= 0 else None
+    if first.vendor == 0x10DE and bpos < 0:
+        out.append("BIT: no BIT table in an NVIDIA ROM")
+    elif bpos >= 0 and bit is None:
+        out.append("BIT: malformed header at +0x%x" % bpos)
+    elif bit is not None:
+        outside = [t["id"] for t in bit.tokens if t["size"] and t["offset"] + t["size"] > len(rom)]
+        if outside:
+            out.append("BIT: token(s) %s point outside the ROM" % ", ".join(outside))
+        version = vbios_version(rom, bit, 0)
+        if version is None and first.vendor == 0x10DE:
+            out.append("BIT: no version ('i') token")
+        signon = {m.group(1).decode().upper() for m in SIGNON_VERSION_RE.finditer(rom)}
+        if version and signon and version not in signon:
+            out.append("BIT: version %s but the sign-on banner says %s" % (version, ", ".join(sorted(signon))))
+    return out
+
+
+def trailing_bytes(after: bytes) -> int:
+    """Non-padding (not 0x00 / 0xFF) bytes in the memory that follows the last image."""
+    return len(after) - after.count(0) - after.count(0xFF)
+
+
+_SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
+
+
+def load_known_good(path: str):
+    """``(hashes, roms)`` from ``path``: a text file of SHA-256 values (``<sha256> [label]`` per line, '#' comments)
+    or a ROM file (its image chain, wherever the first 0x55AA image with a PCIR structure starts)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    hashes = {}
+    if text is not None and "\x00" not in text:
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            m = _SHA256_RE.search(line)
+            if m:
+                hashes[m.group(1).lower()] = line[m.end():].strip() or path
+        if hashes:
+            return hashes, []
+    roms = []
+    for m in re.finditer(rb"\x55\xaa", data):
+        chain = parse_chain(data, m.start())
+        if chain:
+            total = sum(i.length for i in chain)
+            roms.append((path, data[m.start():m.start() + total]))
+            break
+    return hashes, roms
+
+
+def compare_known_good(rom: bytes, hashes: dict, roms: list):
+    """``(matches, note)``: whether ``rom`` equals a known-good image, and where it first differs otherwise."""
+    h = digest(rom)
+    if h in hashes:
+        return True, "matches %s" % hashes[h]
+    for label, ref in roms:
+        if ref == rom:
+            return True, "matches %s" % label
+    notes = []
+    for label, ref in roms:
+        diff = next((i for i, (a, b) in enumerate(zip(rom, ref)) if a != b), min(len(rom), len(ref)))
+        notes.append("differs from %s at +0x%x (%d vs %d bytes)" % (label, diff, len(rom), len(ref)))
+    if hashes and not roms:
+        notes.append("SHA-256 not in the known-good list")
+    return False, "; ".join(notes)
 
 
 def build_rom(vendor: int = 0x10DE, device: int = 0x28A1, version=(0x95, 0x07, 0x2D, 0x00, 0x5F),

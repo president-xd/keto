@@ -5,8 +5,9 @@ from __future__ import annotations
 import datetime as _dt
 import struct
 
+from keto.framework.exceptions import RequirementError
 from keto.framework.plugin import Plugin, Requirement, TimeLinerInterface
-from keto.framework.scanners import AnchoredScanner, scan, scan_aligned_u32
+from keto.framework.scanners import AnchoredScanner, byte_prefilter, scan, scan_aligned_u32
 from keto.framework.treegrid import Address, Bytes, Hex, TreeGrid, na
 from keto.gpu import discovery, pushbuf, qmd as qmd_fmt
 from keto.gpu.gmmu import VID
@@ -83,17 +84,25 @@ class PbScan(Plugin):
     def run(self):
         layer = self.ctx.primary
         db = self.ctx.classdb
-        referenced = []
+        referenced = []  # (start, end, instance block of the channel whose GPFIFO points there)
         try:
             for cc in discovery.channel_commands(self.ctx):
                 for s in cc.segments:
                     if s["pa"] is not None:
-                        referenced.append((s["pa"], s["pa"] + s["length"]))
+                        referenced.append((s["pa"], s["pa"] + s["length"], cc.ib.pa))
         except Exception:
             pass
 
+        def owner(addr):
+            return next((ch for s, e, ch in referenced if s <= addr < e), None)
+
+        def segment_start(addr):
+            return min(s for s, e, ch in referenced if s <= addr < e)
+
         sc = AnchoredScanner([b"\x01\x20", b"\x01\x60", b"\x01\xa0"], pushbuf.SET_OBJECT_RE, before=2, after=8)
         sc.alignment = 4
+        if self.opts["window"] <= 0 or self.opts["min_methods"] < 1:
+            raise RequirementError("--window must be > 0 and --min-methods >= 1")
 
         def rows():
             last_end = -1
@@ -104,6 +113,14 @@ class PbScan(Plugin):
                 data = layer.read(off, self.opts["window"], pad=True)
                 st = pushbuf.DecodeStats()
                 methods, events, _ = pushbuf.interpret(data, off, db, stats=st)
+                # a stream does not run on into a segment another channel submitted (or, for a stray stream,
+                # into any live segment): cut it there and decode it again
+                first = owner(off)
+                cut = next((x.offset for x in methods if owner(x.offset) not in (None, first)), None)
+                if cut is not None:
+                    data = data[:max(0, segment_start(cut) - off)]
+                    st = pushbuf.DecodeStats()
+                    methods, events, _ = pushbuf.interpret(data, off, db, stats=st)
                 while methods and methods[-1].value == 0 and methods[-1].method == 0:
                     methods.pop()
                 if len(methods) < self.opts["min_methods"]:
@@ -114,7 +131,7 @@ class PbScan(Plugin):
                 kinds = {}
                 for ev in events:
                     kinds[ev.kind] = kinds.get(ev.kind, 0) + 1
-                ref = any(s <= off < e for s, e in referenced)
+                ref = owner(off) is not None
                 yield 0, (Address(off), end - off, db.class_name(cls), len(methods), round(score["ratio"], 2),
                           ", ".join("%d %s" % (n, k) for k, n in sorted(kinds.items())), ref)
         return TreeGrid([("Offset", Address), ("Bytes", int), ("FirstClass", str), ("Methods", int),
@@ -126,9 +143,12 @@ class Launches(Plugin):
     CATEGORY = "nvidia.commands"
     DESCRIPTION = ("Lists compute kernel launches: which channel launched what code, grid/block shape, "
                    "registers, shared memory, constant buffers, and the kernel name when the code is known.")
-    METHOD = ("For each SEND_PCAS_A (QMD address >> 8) in a compute-class stream, reads the 256-byte QMD through "
-              "the channel's address space, decodes QMD V03_00 (Ampere/Ada; other versions shown raw), then "
-              "translates PROGRAM_ADDRESS and matches the physical address against located kernel code.")
+    METHOD = ("For each SEND_PCAS_A (QMD address >> 8) in a compute-class stream, reads the QMD (256 or 384 bytes) "
+              "through the channel's address space and decodes it with the layout of the version recorded in the "
+              "descriptor itself (every published layout V00_06..V05_01; a V05_01 task is listed once per "
+              "sub-task, each with its own program, grid, block, registers and constant banks; unknown versions "
+              "shown raw), resolves PROGRAM_ADDRESS (PROGRAM_OFFSET + SET_PROGRAM_REGION_A/B on Kepler..Pascal), "
+              "translates it and matches the physical address against located kernel code.")
     ANALOG = "windows.threads (start addresses) / linux.pscallstack"
     REQUIREMENTS = [CHANNEL_REQ]
 
@@ -148,7 +168,10 @@ class Launches(Plugin):
                 mapping = ln.program_mapping.flags() + " " + ln.program_mapping.aperture if ln.program_mapping \
                     else "UNMAPPED"
                 cbs = ", ".join("cb%d@0x%x+0x%x" % cb for cb in q.constant_buffers()) or "-"
-                yield 0, (label, Address(ln.event.details["qmd_va"]), q.version.upper(),
+                version = q.version.upper()
+                if "sub_tasks" in q.fields:  # V05_01: which sub-task of the task this row is
+                    version += " sub-task %d/%d (%s)" % (q.sub_task, max(1, q.fields["sub_tasks"]), q.qmd_type)
+                yield ln.sub_task and 1 or 0, (label, Address(ln.event.details["qmd_va"]), version,
                           Address(ln.program_va) if ln.program_va is not None else na("program region unknown"),
                           kname, mapping, "%dx%dx%d" % q.grid, "%dx%dx%d" % q.block, q.registers, q.shared_memory,
                           cbs)
@@ -180,10 +203,12 @@ class QmdScan(Plugin):
         def rows():
             seen = set()
             for woff, mask, values in qmd_fmt.scan_signatures():
-                for pa, _ in scan_aligned_u32(layer, woff, qmd_fmt.QMD_SIZE, lambda v: (v & mask) in values):
+                for pa, _ in scan_aligned_u32(layer, woff, qmd_fmt.QMD_SIZE, lambda v: (v & mask) in values,
+                                              prefilter=byte_prefilter(woff, mask, values)):
                     if pa in seen:
                         continue
-                    q = qmd_fmt.decode(layer.read(pa, qmd_fmt.MAX_QMD_SIZE, pad=True))
+                    raw = layer.read(pa, qmd_fmt.MAX_QMD_SIZE, pad=True)
+                    q = qmd_fmt.decode(raw) if qmd_fmt.quick_plausible(raw) else None
                     if q is None or not q.plausible():
                         continue
                     seen.add(pa)
@@ -234,12 +259,18 @@ class Semaphores(Plugin):
     CATEGORY = "nvidia.commands"
     DESCRIPTION = ("Lists GPU semaphore operations (acquire/release from host, compute and copy engines) and the "
                    "value currently stored at each semaphore address.")
-    METHOD = ("Collects SEM_ADDR/SEM_PAYLOAD/SEM_EXECUTE (host), SET_REPORT_SEMAPHORE_A..D (compute) and copy "
-              "LAUNCH_DMA semaphore releases; reads the current 32-bit value through the channel's address space.")
+    METHOD = ("Collects SEM_ADDR/SEM_PAYLOAD/SEM_EXECUTE (host), SET_REPORT_SEMAPHORE_A..D (compute), copy "
+              "LAUNCH_DMA semaphore releases and the RELEASE0 semaphore of each launched QMD (kernel completion); "
+              "reads the current 32-bit value through the channel's address space.")
     ANALOG = "windows.mutantscan"
     REQUIREMENTS = [CHANNEL_REQ]
 
     def run(self):
+        def current(cc, addr):
+            if cc.aspace and cc.aspace.translate(addr):
+                return Hex(int.from_bytes(cc.aspace.layer.read(addr, 4, pad=True), "little"))
+            return na("unmapped")
+
         def rows():
             for cc in _selected(self.ctx, self.opts):
                 for ev in cc.events:
@@ -250,10 +281,16 @@ class Semaphores(Plugin):
                         addr, payload, op, eng = d["semaphore_address"], d["semaphore_payload"], d["semaphore"], "copy"
                     else:
                         continue
-                    cur = na("unmapped")
-                    if cc.aspace and cc.aspace.translate(addr):
-                        cur = Hex(int.from_bytes(cc.aspace.layer.read(addr, 4, pad=True), "little"))
-                    yield 0, (channel_label(self.ctx, cc.ib), eng, op, Address(addr), Hex(payload), cur)
+                    yield 0, (channel_label(self.ctx, cc.ib), eng, op, Address(addr), Hex(payload), current(cc, addr))
+            for ln in discovery.launches(self.ctx):
+                q = ln.qmd
+                if q is None or not q.release_address or not q.fields.get("rel0_enable", 1):
+                    continue
+                if self.opts.get("channel") is not None and ln.channel.ib.pa != self.opts["channel"]:
+                    continue
+                op = "RELEASE_FOUR_WORD" if q.release_four_words else "RELEASE_ONE_WORD"
+                yield 0, (channel_label(self.ctx, ln.channel.ib), "compute (QMD release)", op,
+                          Address(q.release_address), Hex(q.release_payload), current(ln.channel, q.release_address))
         return TreeGrid([("Channel", str), ("Engine", str), ("Operation", str), ("Address", Address),
                          ("Payload", Hex), ("CurrentValue", Hex)], rows())
 
@@ -267,7 +304,8 @@ class GpuTimeline(Plugin, TimeLinerInterface):
     METHOD = ("For host SEM_EXECUTE with RELEASE_TIMESTAMP (bit 25), pre-Volta SEMAPHORED releases with the 16-byte "
               "size, copy LAUNCH_DMA four-word semaphores, compute SET_REPORT_SEMAPHORE_D with STRUCTURE_SIZE four "
               "words, and QMD RELEASE0 four-word structures, reads the 16 bytes at the semaphore address through the "
-              "channel's page tables: payload at +0, PTIMER ns at +8 (NV_PPBDMA manual layout). PTIMER values in the "
+              "channel's page tables: payload at +0, PTIMER ns at +8 (NV_PPBDMA manual layout). Work in GPFIFO entries "
+              "still pending (between GP_GET and GP_PUT) has not run and is left out. PTIMER values in the "
               "Unix-epoch range are also shown as UTC.")
     ANALOG = "linux.boottime / timeliner (GPU clock)"
 
@@ -283,16 +321,21 @@ class GpuTimeline(Plugin, TimeLinerInterface):
             if cc.aspace is None:
                 continue
             label = channel_label(self.ctx, cc.ib)
-            for ev in cc.events:
-                d = ev.details
-                if ev.kind == "semaphore" and d.get("timestamped"):
-                    out.append((cc, label, d["address"], "%s semaphore %s (payload 0x%x)" % (d["engine"], d["op"],
-                                                                                           d["payload"])))
-                elif ev.kind == "copy" and d.get("semaphore_timestamped"):
-                    out.append((cc, label, d["semaphore_address"], "copy 0x%x -> 0x%x (%d bytes) completed"
-                                % (d["src"], d["dst"], d["bytes"])))
+            for seg in cc.segments:
+                if seg["state"] == "pending":  # submitted but not executed yet: it wrote no timestamp
+                    continue
+                for ev in seg["events"]:
+                    d = ev.details
+                    if ev.kind == "semaphore" and d.get("timestamped"):
+                        out.append((cc, label, d["address"], "%s semaphore %s (payload 0x%x)"
+                                    % (d["engine"], d["op"], d["payload"])))
+                    elif ev.kind == "copy" and d.get("semaphore_timestamped"):
+                        out.append((cc, label, d["semaphore_address"], "copy 0x%x -> 0x%x (%d bytes) completed"
+                                    % (d["src"], d["dst"], d["bytes"])))
         for ln in discovery.launches(self.ctx):
             q = ln.qmd
+            if ln.state == "pending" or ln.sub_task:  # the release belongs to the task: report it once
+                continue
             if q is not None and q.release_four_words and ln.channel.aspace is not None:
                 name = ln.kernel.kernel.name if ln.kernel else "unknown kernel"
                 out.append((ln.channel, channel_label(self.ctx, ln.channel.ib), q.release_address,

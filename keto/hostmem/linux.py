@@ -2,16 +2,18 @@
 
 Address translation (``arch/x86/include/asm/page_64.h``, ``pgtable_64_types.h``):
 
-* kernel image (``__START_KERNEL_map`` = 0xffffffff80000000 and up):
+* kernel image (``_text`` .. ``_end``, above ``__START_KERNEL_map`` = 0xffffffff80000000):
   ``pa = va - __START_KERNEL_map + phys_base``
 * direct map (``page_offset_base`` .. + physical RAM): ``pa = va - page_offset_base``
 * anything else (vmalloc, vmemmap, modules): walk ``init_top_pgt`` (4-level, or
   5-level when ``__pgtable_l5_enabled``), honouring 1 GiB / 2 MiB large pages.
 
-With KASLR the kernel's physical load address is unknown in a raw image. It is
+With KASLR the kernel's physical load address is unknown in a raw image. A kcore
+container records it (checked cheaply at its expected location); otherwise it is
 recovered by finding the ``linux_banner`` string: for each ``"Linux version "`` hit
 the candidate ``phys_base`` is checked against the ``phys_base`` variable stored in
-the image itself, which must hold the same value. Symbol addresses come from
+the image itself, which must hold the same value. Over ``/proc/kcore`` it comes from
+the kernel-text segment's physical address. Symbol addresses come from
 ``/proc/kallsyms`` (or ``System.map``) taken from the same boot; struct layouts come
 from that boot's BTF (``hostmem.btf``).
 """
@@ -30,7 +32,7 @@ from keto.hostmem import btf as btf_mod
 START_KERNEL_MAP = 0xFFFFFFFF80000000
 PTE_ADDR = 0x000FFFFFFFFFF000
 #: symbols the host-memory plugins use; acquisition stores these from /proc/kallsyms
-WANTED_SYMBOLS = ("_text", "_stext", "linux_banner", "phys_base", "page_offset_base", "vmalloc_base",
+WANTED_SYMBOLS = ("_text", "_stext", "_etext", "_end", "linux_banner", "phys_base", "page_offset_base", "vmalloc_base",
                   "vmemmap_base", "__pgtable_l5_enabled", "init_top_pgt", "init_task", "dxgdrv", "dxgk_fops",
                   "nvidia_fops", "nv_linux_devices", "g_resServ", "g_uvm_global", "init_pid_ns")
 
@@ -89,6 +91,14 @@ class KcoreReader:
         return [(p, s, v) for v, s, _o, p in self.segments
                 if p not in (0xFFFFFFFFFFFFFFFF,) and v - p == page_offset_base]
 
+    def text_phys_base(self, text_va: int) -> Optional[int]:
+        """``phys_base`` from the segment holding ``_text``: /proc/kcore gives the kernel-text segment
+        ``p_paddr = __pa_symbol(_text) = _text - __START_KERNEL_map + phys_base``."""
+        for v, s, _o, p in self.segments:
+            if v <= text_va < v + s and p != 0xFFFFFFFFFFFFFFFF:
+                return p + (text_va - v) - (text_va - START_KERNEL_MAP)
+        return None
+
     def close(self):
         os.close(self.fd)
 
@@ -98,14 +108,25 @@ class KernelMemory:
 
     def __init__(self, btf: btf_mod.Btf, symbols: Dict[str, int], phys: Optional[DataLayer] = None,
                  kcore: Optional[KcoreReader] = None, phys_base: Optional[int] = None,
-                 page_offset_base: Optional[int] = None, l5: Optional[bool] = None, pad_gaps: bool = False):
+                 page_offset_base: Optional[int] = None, l5: Optional[bool] = None, pad_gaps=False,
+                 phys_base_hint: Optional[int] = None):
+        """``pad_gaps``: read omitted (all-zero) pages of a sparse image as zeros - True, or a list of
+        ``(start, size)`` physical ranges outside which nothing was acquired. ``phys_base_hint``: the value recorded
+        at acquisition, used when the image confirms it (else the image is scanned)."""
         if phys is None and kcore is None:
             raise RequirementError("kernel memory needs a physical RAM image or /proc/kcore")
         self.btf, self.symbols, self.phys, self.kcore, self.pad_gaps = btf, symbols, phys, kcore, pad_gaps
         self.notes: List[str] = []
+        # the kernel image is mapped linearly from _text to _end; modules and fixmap above it need the page tables
+        self._image = (symbols["_text"], symbols["_end"]) if "_text" in symbols and "_end" in symbols else \
+            (START_KERNEL_MAP, 1 << 64)
         self.phys_base = phys_base
         if phys is not None and phys_base is None:
-            self.phys_base = self._find_phys_base()
+            self.phys_base = self._find_phys_base(phys_base_hint)
+        elif kcore is not None and phys_base is None and "_text" in symbols:
+            self.phys_base = kcore.text_phys_base(symbols["_text"])
+            if self.phys_base is not None:
+                self.notes.append("phys_base 0x%x from the /proc/kcore kernel-text segment" % self.phys_base)
         self.page_offset_base = page_offset_base if page_offset_base is not None else \
             self.u64(self.sym("page_offset_base"))
         if l5 is None:
@@ -121,17 +142,29 @@ class KernelMemory:
             raise RequirementError("kernel symbol %s not available (kallsyms from the same boot needed)" % name)
         return self.symbols[name]
 
-    def _find_phys_base(self) -> int:
-        va_banner, va_pb = self.sym("linux_banner"), self.sym("phys_base")
+    def _phys_base_ok(self, cand: int) -> bool:
+        """With the kernel loaded at ``cand``, linux_banner is in place and the phys_base variable holds ``cand``."""
+        if cand < 0 or cand & 0xFFF:
+            return False
+        try:
+            banner = self.phys.read(self.sym("linux_banner") - START_KERNEL_MAP + cand, 14)
+            val = struct.unpack("<Q", self.phys.read(self.sym("phys_base") - START_KERNEL_MAP + cand, 8))[0]
+        except InvalidAddressException:
+            return False
+        return banner == b"Linux version " and val == cand
+
+    def _find_phys_base(self, hint: Optional[int] = None) -> int:
+        if hint is not None:
+            if self._phys_base_ok(hint):
+                self.notes.append("phys_base 0x%x recorded at acquisition, confirmed by linux_banner and the "
+                                  "phys_base variable" % hint)
+                return hint
+            self.notes.append("WARNING: phys_base 0x%x recorded at acquisition is not confirmed by the image; "
+                              "scanning for linux_banner" % hint)
+        va_banner, _ = self.sym("linux_banner"), self.sym("phys_base")  # missing symbols fail before the scan
         for off, _ in scan(self.phys, BytesScanner(b"Linux version ")):
             cand = off - (va_banner - START_KERNEL_MAP)
-            if cand < 0 or cand & 0xFFF:
-                continue
-            try:
-                val = struct.unpack("<Q", self.phys.read(va_pb - START_KERNEL_MAP + cand, 8))[0]
-            except InvalidAddressException:
-                continue
-            if val == cand:
+            if self._phys_base_ok(cand):
                 self.notes.append("phys_base 0x%x located from linux_banner and confirmed by the phys_base "
                                   "variable" % cand)
                 return cand
@@ -140,7 +173,7 @@ class KernelMemory:
 
     # -- translation ---------------------------------------------------------------------------------------
     def v2p(self, va: int) -> int:
-        if va >= START_KERNEL_MAP:
+        if self._image[0] <= va < self._image[1]:
             return va - START_KERNEL_MAP + self.phys_base
         if self.page_offset_base <= va < self.page_offset_base + (1 << (55 if self.l5 else 46)):
             return va - self.page_offset_base
@@ -164,7 +197,10 @@ class KernelMemory:
         raise InvalidAddressException("kernel", va, "walk failed")
 
     def _phys_read(self, pa: int, n: int) -> bytes:
-        return self.phys.read(pa, n, pad=self.pad_gaps)
+        pad = self.pad_gaps
+        if pad and pad is not True:  # zero pages were omitted only inside the acquired ranges
+            pad = any(s <= pa and pa + n <= s + size for s, size in pad)
+        return self.phys.read(pa, n, pad=bool(pad))
 
     def read(self, va: int, n: int) -> bytes:
         if self.kcore is not None:

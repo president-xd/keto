@@ -1,6 +1,8 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+# in-tree, standard-library-only backend: no setuptools and no network needed to build or install
+requires = []
+build-backend = "keto_build"
+backend-path = ["tools/build"]
 
 [project]
 name = "keto"
@@ -21,9 +23,3 @@ yara = ["yara-python>=4.3"]
 
 [project.scripts]
 keto = "keto.cli:main"
-
-[tool.setuptools.packages.find]
-include = ["keto*"]
-
-[tool.setuptools.package-data]
-"keto" = ["symbols/nvidia/*.json", "rules/*.yar"]

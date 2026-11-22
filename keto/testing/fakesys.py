@@ -17,8 +17,7 @@ import struct
 from typing import Any, Dict, List
 
 from keto.formats.cubin import build_cubin
-from keto.framework.exceptions import LiveSourceError
-from keto.live.source import ALLOWED_COMMANDS, MAX_TEXT, LiveSource, keep_env
+from keto.live.source import MAX_TEXT, LiveSource, check_command, keep_env
 
 NOW = 1794880000.0          # 2026-11-17
 BOOT = NOW - 86400.0
@@ -34,6 +33,7 @@ class FakeSystemSource(LiveSource):
         self.links: Dict[str, str] = s.get("links", {})
         self.stats: Dict[str, dict] = s.get("stats", {})
         self.extra_dirs = set(s.get("dirs", []))
+        self.unreadable_dirs = set(s.get("unreadable_dirs", []))  # listed in their parent, listdir() fails
         self.procs: Dict[int, dict] = {int(k): v for k, v in s.get("procs", {}).items()}
         self._nvml = s.get("nvml", {"available": False, "error": "no NVML", "devices": []})
         self._cuda = s.get("cuda", {"available": False, "error": "no CUDA"})
@@ -47,13 +47,20 @@ class FakeSystemSource(LiveSource):
 
     # -- filesystem -----------------------------------------------------------------
     def _all_paths(self):
-        return list(self.files) + list(self.links) + list(self.stats) + list(self.extra_dirs)
+        return list(self.files) + list(self.links) + list(self.stats) + list(self.extra_dirs) + \
+            list(self.unreadable_dirs)
+
+    @staticmethod
+    def _prefix(path):
+        """Directory prefix of ``path``: Windows paths (``C:\\...``) use backslashes."""
+        sep = "\\" if "\\" in path or path[1:2] == ":" else "/"
+        path = path.rstrip(sep) or sep
+        return path, (path + sep if path != sep else sep)
 
     def _is_dir(self, path):
-        path = path.rstrip("/") or "/"
+        path, prefix = self._prefix(path)
         if path in self.extra_dirs:
             return True
-        prefix = path + "/" if path != "/" else "/"
         return any(p.startswith(prefix) for p in self._all_paths())
 
     def read_bytes(self, path, limit=MAX_TEXT):
@@ -70,14 +77,13 @@ class FakeSystemSource(LiveSource):
         return None if data is None else data.decode("utf-8", "replace")
 
     def listdir(self, path):
-        path = path.rstrip("/") or "/"
-        if not self._is_dir(path):
+        path, prefix = self._prefix(path)
+        if not self._is_dir(path) or path in self.unreadable_dirs:
             return None
-        prefix = path + "/" if path != "/" else "/"
         names = set()
         for p in self._all_paths():
             if p.startswith(prefix):
-                names.add(p[len(prefix):].split("/", 1)[0])
+                names.add(p[len(prefix):].split(prefix[-1], 1)[0])
         return sorted(n for n in names if n)
 
     def readlink(self, path):
@@ -122,6 +128,57 @@ class FakeSystemSource(LiveSource):
     def win_gpu(self):
         return self.win.get("gpu", {"available": False, "processes": {}})
 
+    def win_adapters(self):
+        return self.win.get("adapters", [])
+
+    def win_cmdline(self, pid):
+        return self.win.get("cmdlines", {}).get(str(pid))
+
+    def win_signature(self, path):
+        return self.win.get("signatures", {}).get((path or "").lower())
+
+    def registry_key(self, path):
+        """Keys are case-insensitive, as in the registry; a key's subkeys are the deeper scenario keys."""
+        keys = {k.lower(): (k, v) for k, v in self.win.get("registry_keys", {}).items()}
+        prefix = path.lower().rstrip("\\") + "\\"
+        subs = sorted({orig[len(prefix):].split("\\", 1)[0] for low, (orig, _) in keys.items()
+                       if low.startswith(prefix)})
+        hit = keys.get(path.lower().rstrip("\\"))
+        if hit is None and not subs:
+            return None
+        values = copy.deepcopy((hit[1] if hit else {}).get("values", {}))
+        return {"values": values, "subkeys": subs}
+
+    def win_process_info(self, pid):
+        info = self.win.get("process_info", {}).get(str(pid))
+        if info is None:
+            return None
+        info = copy.deepcopy(info)
+        if info.get("environ") is not None:
+            info["environ_total"] = len(info["environ"])
+            info["environ"] = {k: v for k, v in info["environ"].items() if keep_env(k) or keep_env(k.upper())}
+        return info
+
+    def win_drivers(self):
+        return copy.deepcopy(self.win.get("drivers", []))
+
+    def win_file_version(self, path):
+        return copy.deepcopy(self.win.get("versions", {}).get((path or "").lower()))
+
+    def win_regions(self, pid):
+        return copy.deepcopy(self.win.get("regions", {}).get(str(pid)))
+
+    def win_handles(self, pid):
+        """``windows.handles`` holds the raw File handle names of a process; like windows.HandleTable only the
+        GPU-related ones are returned (None: the process is listed in ``windows.handles_unreadable``)."""
+        if pid in self.win.get("handles_unreadable", []):
+            return None
+        from keto.live.gpuhandles import handle_kind
+        names = self.win.get("handles", {}).get(str(pid), [])
+        out = [{"handle": h, "access": 0x120089, "name": n, "kind": handle_kind(n)}
+               for h, n in names if handle_kind(n)]
+        return {"handles": out, "file_handles": len(names), "unresolved": 0}
+
     # -- processes -------------------------------------------------------------------
     def pids(self):
         return sorted(self.procs)
@@ -153,8 +210,7 @@ class FakeSystemSource(LiveSource):
         return copy.deepcopy(self._cuda)
 
     def command(self, argv, timeout=30):
-        if not argv or os.path.basename(argv[0]) not in ALLOWED_COMMANDS:
-            raise LiveSourceError("command %r is not on the read-only allow list" % (argv[:1],))
+        check_command(argv)
         for cargv, result in self.commands:
             if list(cargv) == list(argv):
                 return dict(result)

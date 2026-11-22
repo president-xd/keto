@@ -110,8 +110,51 @@ def horizontal_smoothness(pixels: bytes, bpp: int = 4, samples: int = 4096) -> f
     return total / count if count else 255.0
 
 
+_Q4 = bytes(b >> 4 for b in range(256))
+
+
+def autocorr_width(pixels: bytes, bpp: int = 4, min_w: int = 16, max_w: int = 8192, window: int = 6144
+                   ) -> Optional[int]:
+    """Row width (pixels) by autocorrelation: the shift at which the colour bytes best repeat themselves.
+
+    Colour channels (alpha dropped) are quantised to 4 bits; for every candidate width the fraction of equal
+    bytes between the stream and itself shifted by one row is computed with one big-integer XOR (C speed). The
+    best width must stand out from the median score, and when a divisor of it (w/2, w/3 ...) scores almost as
+    well the divisor is the real row width (2w, 3w ... repeat too)."""
+    colour = bytes(b for i, b in enumerate(pixels[:bpp * (max_w * 2 + window)]) if i % bpp != bpp - 1)
+    q = colour.translate(_Q4)
+    cpp = bpp - 1
+    n = window * cpp
+    if len(q) < min_w * cpp + n:
+        return None
+    base = int.from_bytes(q[:n], "little")
+    scores = {}
+    for w in range(min_w, max_w + 1):
+        off = w * cpp
+        if off + n > len(q):
+            break
+        x = (base ^ int.from_bytes(q[off:off + n], "little")).to_bytes(n, "little")
+        scores[w] = x.count(0) / n
+    if not scores:
+        return None
+    ranked = sorted(scores.values())
+    median = ranked[len(ranked) // 2]
+    best = max(scores, key=lambda w: (scores[w], -w))
+    if scores[best] - median < 0.12:
+        return None  # flat or noisy region: no row structure
+    for k in range(8, 1, -1):  # prefer the fundamental over its multiples
+        if best % k == 0 and best // k >= min_w and scores.get(best // k, 0) >= scores[best] - 0.02:
+            return best // k
+    return best
+
+
 def guess_width(pixels: bytes, candidates=None, bpp: int = 4) -> Optional[int]:
-    """Pick the row width (in pixels) whose vertical neighbours are most similar."""
+    """Row width in pixels: autocorrelation first (any integer width 16..8192); when it finds no clear row
+    structure, the width (multiple of 16, 64..4096) whose vertical neighbours are most similar."""
+    if candidates is None:
+        w = autocorr_width(pixels, bpp)
+        if w:
+            return w
     candidates = candidates or [w for w in range(64, 4097, 16)]
     best, best_score = None, None
     for w in candidates:

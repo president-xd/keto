@@ -17,11 +17,15 @@ instead of being misparsed.
 from __future__ import annotations
 
 import os
+import re
 import struct
 from typing import Iterator, List, Optional
 
 ENTRY_HDR = struct.Struct("<IQQQ")  # 28 bytes
 INDEX_HDR = struct.Struct("<IIQ")   # 16 bytes
+
+
+_STAMP_RE = re.compile(r"([A-Z][a-z]{2} [ \d]\d \d{4}) ?(\d{2}:\d{2}:\d{2}) ?(HOST\d+)? ?(sm_\d+[a-z]?)?")
 
 
 class CacheEntry:
@@ -42,7 +46,14 @@ class CacheEntry:
     def stamp(self) -> str:
         head = self.text[:max(self.text.find(b".version"), 0) or 200]
         parts = [p.decode("ascii", "replace").strip() for p in head.replace(b"\r", b"\n").split(b"\n")]
-        return " ".join(p for p in parts if p and not p.startswith("//"))[:120]
+        text = " ".join(p for p in parts if p and not p.startswith("//"))
+        # the driver writes __DATE__, __TIME__, the host ABI and the target back to back:
+        # "Jun  3 202617:23:34HOST64sm_89" -> "Jun 3 2026 17:23:34, HOST64, sm_89"
+        m = _STAMP_RE.match(text)
+        if m:
+            fields = ["%s %s" % (" ".join(m.group(1).split()), m.group(2))] + [g for g in m.group(3, 4) if g]
+            text = ", ".join(fields) + text[m.end():]
+        return text[:120]
 
 
 def parse_entry(data: bytes, path: str = "", key_hash: Optional[int] = None) -> CacheEntry:

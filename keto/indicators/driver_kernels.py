@@ -22,6 +22,7 @@ _PATTERNS = [
     r"(Char|Short|Int)Aligned_\w+",
     # compiler / device-runtime support routines
     r"__cuda_(sm\w+|syscall\w*)",
+    r"_Z\d+__cuda_(sm\w+|syscall\w*)",  # the same routines, C++-mangled (e.g. _Z28__cuda_syscall_bw_tld_shared...)
     r"syscall_(no_stack_switch_)?trampoline_\w+",
     r"_ZN\d+_INTERNAL_[0-9a-f]+_\d+_(opencl_)?syscall_device_shared_cu_[\w$]+",
     r"_Z\d+(Free|Malloc)Internal[\w$]*",
@@ -29,7 +30,8 @@ _PATTERNS = [
     r"(vfprintf_internal|vfprintf|vprintf|malloc|free|__assertfail|__profile)",
     # CUDA Dynamic Parallelism (CNP) device runtime and device-side runtime API stubs
     r"cnp\w+",
-    r"cuda(Graph|Device|Stream|Event|Malloc|Free|Get|Set|Launch|Func|Peek|Occupancy|Memcpy|Memset|Runtime)\w*",
+    r"cuda(Graph|Device|Stream|Event|Malloc|Free|Get|Set|Launch|Func|Peek|Occupancy|Memcpy|Memset|Runtime|"
+    r"Subgrid|Fabric)\w*",  # Subgrid*/Fabric* seen in every CUDA process on driver 610.91 (WSL2 and Windows)
     # CUDA graph / fork-join schedulers
     r"(ampereForkScheduler|conditionalScheduler|deviceGraphScheduler|forkJoinScheduler|exitfunction)",
     r"(cg_entry|tex_entry|entry_exit|generic_entry)",
@@ -41,6 +43,20 @@ _PATTERNS = [
     r"membar_war_bug\d+",
 ]
 _RX = re.compile(r"^(?:%s)$" % "|".join(_PATTERNS))
+
+
+#: NVIDIA user-mode driver libraries that carry GPU kernels of their own (CUDA, OpenCL, video decode/encode,
+#: D3D/Vulkan/OpenGL user-mode drivers, OptiX, DLSS/NGX, AI video effects...): Windows DLL and Linux/WSL .so names
+NVIDIA_LIBRARY_RE = re.compile(
+    r"(?i)(?:^|[\\/])(?:lib)?(?:nvcuda|cuda|nvopencl|nvidia-opencl|nvcuvid|nvidia-encode|nvencodeapi|nvd3dum|"
+    r"nvwgf2um|nvdxdlkernels|nvoptix|nvidia-rtcore|nvdirectsr|nvppex|nvpresent|nvngx|nvai\w*|nvdlpp\w*|nvoglv|"
+    r"nvidia-glcore|nvidia-eglcore|nvidia-gpucomp|nvidia-ptxjitcompiler|nvptxjitcompiler|nvidia-nvvm|nvvm|"
+    r"nvoptix|nvldumd|nvgpucomp|nvrtc)[\w.\-]*\.(?:dll|so(?:\.\d+)*)$")
+
+
+def is_nvidia_library(path: str) -> bool:
+    """True for the on-disk path of an NVIDIA user-mode driver library (whose embedded kernels are driver code)."""
+    return bool(path) and bool(NVIDIA_LIBRARY_RE.search(path.replace(" (deleted)", "")))
 
 
 def is_driver_internal(name: str) -> bool:

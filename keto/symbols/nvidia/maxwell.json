@@ -49,7 +49,7 @@
     "GMMU VER1 (40-bit VA, dual big/small PDE, 64/128 KiB big pages): NVIDIA published maxwell/gm107 dev_mmu.h; split from nouveau gf100/gk104/gm200 VMM descriptors (NVIDIA_HW_FACTS.md 1.2-1.8).",
     "Chipset ids (NV_PMC_BOOT_0[28:20]), NVML architecture ids and CUDA compute capabilities: docs/research/NVIDIA_HW_FACTS.md section 5 (ids marked 'derived' are not listed by any source).",
     "Engine classes per chip: docs/research/NVIDIA_COMMAND_FACTS.md section 0 (nouveau/GSP-RM/nvgpu tables).",
-    "QMD version is read from each descriptor (all published layouts V00_06..V05_00 are decoded).",
+    "QMD version is read from each descriptor (all published layouts V00_06..V05_01 are decoded, V05_01 per sub-task).",
     "Before GM20x the big page size is a global register (default 128 KiB), not in the instance block: override with --big-page 64K if the driver was configured for 64 KiB."
   ]
 }

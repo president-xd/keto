@@ -24,7 +24,11 @@ from typing import Dict, List, Tuple
 from keto.framework.profiles import Profile
 
 log = logging.getLogger("keto.automagic")
-NAME_RE = re.compile(rb"NVIDIA (?:GeForce |Quadro |Tesla |RTX |TITAN )?[\w ]{2,40}?(?:GPU|Laptop GPU|\b)")
+#: a GPU product name as drivers print it: "NVIDIA " and up to 7 name words (greedy, stops at NUL/punctuation),
+#: e.g. "NVIDIA GeForce RTX 4050 Laptop GPU", "NVIDIA H100 80GB HBM3"; or nvidia-smi's bare "Tesla <model>"
+#: ("Tesla V100-SXM2-16GB": a letter+digits model number, so prose such as "Tesla Model S" does not match)
+NAME_RE = re.compile(rb"NVIDIA (?:GeForce |Quadro |Tesla |RTX |TITAN |DGX )?[A-Za-z0-9][\w\-]*(?: [\w\-]+){0,6}"
+                     rb"|Tesla [A-Z]\d{1,4}[\w\-]*")
 
 
 def _from_device(reg, dev: dict):
@@ -66,7 +70,7 @@ def _vote(votes, why, names, weight, reason):
 def _from_structures(ctx, reg) -> Tuple[object, str]:
     """Vote for a profile from GPU structures found in the VRAM image itself."""
     from keto.framework.layers import BytesLayer
-    from keto.framework.scanners import AnchoredScanner, scan, scan_aligned_u32
+    from keto.framework.scanners import AnchoredScanner, byte_prefilter, scan, scan_aligned_u32
     from keto.gpu import pushbuf, qmd as qmd_fmt
     from keto.gpu.ramin import parse_instance_block
     layer = ctx.layers.get("vram")
@@ -97,7 +101,8 @@ def _from_structures(ctx, reg) -> Tuple[object, str]:
         p, fc = ps[0], ps[0].ramfc
         mask, value = fc.get("signature_mask", 0xFFFF), fc.get("signature_value", 0xFACE)
         n = 0
-        for pa, _ in scan_aligned_u32(layer, fc["signature"], 4096, lambda v: (v & mask) == value):
+        for pa, _ in scan_aligned_u32(layer, fc["signature"], 4096, lambda v: (v & mask) == value,
+                                      prefilter=byte_prefilter(fc["signature"], mask, value)):
             if parse_instance_block(layer, pa, p, ctx.vram_size).valid:
                 n += 1
         if n > best_n:
@@ -113,8 +118,10 @@ def _from_structures(ctx, reg) -> Tuple[object, str]:
     head = BytesLayer("head", layer.read(layer.minimum_address, min(layer.size, QMD_SCAN_LIMIT), pad=True))
     versions = set()
     for woff, mask, values in qmd_fmt.scan_signatures():
-        for off, _ in scan_aligned_u32(head, woff, qmd_fmt.QMD_SIZE, lambda v: (v & mask) in values):
-            q = qmd_fmt.decode(head.read(off, qmd_fmt.MAX_QMD_SIZE, pad=True))
+        for off, _ in scan_aligned_u32(head, woff, qmd_fmt.QMD_SIZE, lambda v: (v & mask) in values,
+                                       prefilter=byte_prefilter(woff, mask, values)):
+            raw = head.read(off, qmd_fmt.MAX_QMD_SIZE, pad=True)
+            q = qmd_fmt.decode(raw) if qmd_fmt.quick_plausible(raw) else None
             if q is not None and q.plausible():
                 versions.add(q.version)
     for v in sorted(versions):
@@ -130,10 +137,9 @@ def _from_structures(ctx, reg) -> Tuple[object, str]:
     return reg.get(name), "structures in the image: %s%s" % ("; ".join(why[name]), note)
 
 
-def choose_profile(ctx, requested=None) -> Tuple[Profile, str]:
-    reg = ctx.registry
-    if requested:
-        return reg.get(requested), "selected with --profile"
+def _cheap_evidence(ctx, reg) -> Tuple[object, str]:
+    """Profile evidence that costs no image-wide scan: container metadata, the live/snapshot NVML view, and GPU
+    name banners in the first 64 MiB of the image."""
     dev = ctx.metadata.get("device") or {}
     p, why = _from_device(reg, dev)
     if p:
@@ -157,6 +163,23 @@ def choose_profile(ctx, requested=None) -> Tuple[Profile, str]:
             p = reg.by_device_name(m.group().decode("ascii", "replace"))
             if p:
                 return p, "GPU name banner %r in image" % m.group().decode("ascii", "replace")
+    return None, ""
+
+
+def choose_profile(ctx, requested=None) -> Tuple[Profile, str]:
+    reg = ctx.registry
+    if requested:
+        chosen = reg.get(requested)
+        p, why = _cheap_evidence(ctx, reg)
+        if p is not None and p.name != chosen.name:
+            log.warning("--profile %s contradicts the evidence (%s points to %s): structures will be decoded "
+                        "with the wrong layout and results may be wrong", chosen.name, why, p.name)
+            return chosen, "selected with --profile, CONTRADICTING %s (%s)" % (p.name, why)
+        return chosen, "selected with --profile"
+    p, why = _cheap_evidence(ctx, reg)
+    if p:
+        return p, why
+    if ctx.has_image():
         try:
             p, why = _from_structures(ctx, reg)
         except Exception as exc:  # structural voting is best effort
