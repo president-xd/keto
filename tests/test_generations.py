@@ -12,7 +12,7 @@ import unittest
 
 from keto.framework.context import Context
 from keto.framework.plugin import PLUGINS, load_plugins
-from keto.testing.synth import GENERATIONS, build_all
+from keto.testing.synth import GENERATIONS, STRUCTURAL_TWIN, build_all
 
 
 def col(grid, name):
@@ -50,15 +50,18 @@ class _Generation:
 
     def test_profile_detected_from_structures_alone(self):
         """A bare raw dump (no metadata sidecar, banners wiped) is still recognised from the class ids bound
-        with SET_OBJECT, the QMD version bytes and the instance-block layout."""
+        with SET_OBJECT, the QMD version bytes and the instance-block layout (Rubin's structures are Blackwell's,
+        so a bare Rubin dump is analysed with the identical Blackwell profile)."""
         with open(os.path.join(self.tmp, "synthetic_vram.raw"), "rb") as fh:
             data = bytearray(fh.read())
         data[0x100:0x600] = bytes(0x500)
+        rom = self.truth["vbios"]["pa"]
+        data[rom:rom + 0x1000] = bytes(0x1000)  # the VBIOS sign-on string names a GPU too
         bare = os.path.join(self.tmp, "bare.raw")
         with open(bare, "wb") as fh:
             fh.write(data)
         with Context(image=bare) as c:
-            self.assertEqual(c.profile.name, self.GEN, c.profile_reason)
+            self.assertEqual(c.profile.name, STRUCTURAL_TWIN.get(self.GEN, self.GEN), c.profile_reason)
             self.assertIn("structures in the image", c.profile_reason)
 
     def test_instance_blocks_and_privilege(self):

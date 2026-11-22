@@ -14,7 +14,7 @@ import json
 import os
 from typing import Dict, List, Optional
 
-from keto.framework.exceptions import FormatError
+from keto.framework.exceptions import FormatError, RequirementError
 
 SYMBOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "symbols")
 
@@ -175,7 +175,7 @@ class ProfileRegistry:
     # -- lookups ----------------------------------------------------------------
     def get(self, name: str) -> Profile:
         if name not in self.profiles:
-            raise KeyError("unknown profile %r (available: %s)" % (name, ", ".join(sorted(self.profiles))))
+            raise RequirementError("unknown profile %r (available: %s)" % (name, ", ".join(sorted(self.profiles))))
         return self.profiles[name]
 
     def by_chipset(self, chipset: int) -> Optional[Profile]:

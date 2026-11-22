@@ -319,7 +319,8 @@ class MalwarePlugins(unittest.TestCase):
         _, rows = run("nvidia.malware.masquerade")
         f = {(r["PID"], r["Finding"]) for r in rows}
         self.assertIn((1400, "kernel-thread style name [kworker/0:1] on a user-space process"), f)
-        self.assertIn((2200, "NVIDIA daemon name running from non-standard path"), f)
+        self.assertIn((2200, "NVIDIA daemon name nvidia-persistenced running from /home/bob/.local/bin/"
+                             "nvidia-persistenced instead of its packaged path /usr/bin/nvidia-persistenced"), f)
         self.assertNotIn(1200, col(rows, "PID"))   # python3 vs python3.10 is fine
         self.assertNotIn(900, col(rows, "PID"))    # real persistenced
 
@@ -355,7 +356,7 @@ class MalwarePlugins(unittest.TestCase):
 class RecordReplay(unittest.TestCase):
     PLUGINS_TO_CHECK = ["nvidia.pslist", "nvidia.pstree", "nvidia.envars", "nvidia.libs", "nvidia.devices",
                         "nvidia.xid", "nvidia.computecache", "nvidia.autostart", "nvidia.modules", "nvidia.devnodes",
-                        "nvidia.malware.gpuxview", "nvidia.malware.libhooks", "nvidia.malware.integrity",
+                        "nvidia.malware.gpuxview", "nvidia.malware.integrity",
                         "nvidia.malware.cryptojack", "nvidia.accounting"]
 
     def test_snapshot_replay_is_identical(self):
@@ -479,9 +480,23 @@ def windows_scenario():
                     "900": []},
         "windowed": [500, 600],
         "gpu": {"available": True, "processes": {
-            "601": {"engines": {"3D": 12.0}, "luids": ["0x0_0x1"], "dedicated": 1 << 26, "shared": 0},
-            "700": {"engines": {"Compute_0": 35.0}, "luids": ["0x0_0x1"], "dedicated": 1 << 24, "shared": 0},
-            "800": {"engines": {"Compute_0": 99.0}, "luids": ["0x0_0x1"], "dedicated": 3 << 30, "shared": 0}}}}
+            "601": {"engines": {"3D": 12.0}, "luids": ["0x0_0x1"], "dedicated": 1 << 26, "shared": 0,
+                    "by_luid": {"0x0_0x1": {"dedicated": 1 << 26, "shared": 0}}},
+            "700": {"engines": {"Compute_0": 35.0}, "luids": ["0x0_0x1"], "dedicated": 1 << 24, "shared": 0,
+                    "by_luid": {"0x0_0x1": {"dedicated": 1 << 24, "shared": 0}}},
+            "800": {"engines": {"Compute_0": 99.0}, "luids": ["0x0_0x1"], "dedicated": 3 << 30, "shared": 0,
+                    "by_luid": {"0x0_0x1": {"dedicated": 3 << 30, "shared": 0}}}},
+                "adapters": {"0x00000000_0x00000001": {"dedicated": (3 << 30) + (1 << 26) + (1 << 24), "shared": 0}}},
+        "adapters": [{"luid": "0x00000000_0x00000001", "name": "NVIDIA GeForce RTX 4050 Laptop GPU",
+                      "vendor_id": 0x10DE, "device_id": 0x28A1, "dedicated_video_memory": 6 << 30}],
+        "cmdlines": {"600": "chrome.exe", "601": "chrome.exe --type=gpu-process",
+                     "700": appdata + "ArmouryCrate.exe", "800": "xmrig.exe -o stratum+tcp://pool:3333 --cuda"},
+        "signatures": {"c:\\program files\\chrome.exe": {"status": "valid", "signer": "Google LLC", "kind": "embedded"},
+                       appdata.lower() + "armourycrate.exe": {"status": "unsigned", "signer": None, "kind": "embedded"},
+                       "c:\\windows\\system32\\opencl.dll": {"status": "valid", "signer": "NVIDIA Corporation",
+                                                            "kind": "embedded"},
+                       "c:\\windows\\system32\\nvopencl64.dll": {"status": "BAD DIGEST (modified after signing)",
+                                                                "signer": None, "kind": "embedded"}}}
     return sc
 
 
@@ -497,6 +512,78 @@ class WindowsTriage(unittest.TestCase):
         self.assertIn("user-writable", by[700]["Attention"])
         self.assertEqual(by[800]["Severity"], "high")   # miner name + CUDA + busy without a window
         self.assertIn("indicator", by[800]["Attention"])
+        # command line, signatures and adapter names
+        self.assertIn("indicator in command line", by[800]["Attention"])
+        self.assertIn("stratum+tcp", by[800]["CommandLine"])
+        self.assertIn("GPU-using image is unsigned", by[700]["Attention"])
+        self.assertIn("BAD DIGEST", by[700]["Attention"])      # tampered OpenCL driver DLL
+        self.assertEqual(by[601]["Signature"], "valid (Google LLC)")
+        self.assertEqual(by[601]["Adapters"], "NVIDIA GeForce RTX 4050 Laptop GPU")
+
+    def test_scraper_windows_and_nvml(self):
+        sc = windows_scenario()
+        g = sc["windows"]["gpu"]["processes"]["700"]
+        g["by_luid"]["0x0_0x1"]["dedicated"] = 5 << 30  # 5 GiB of a 6 GiB card
+        _, rows = run("nvidia.malware.scraper", FakeSystemSource(sc))
+        self.assertEqual([(r["PID"], r["Severity"]) for r in rows], [(700, "high")])
+        self.assertIn("no visible window", rows[0]["Finding"])
+        lin = default_scenario()
+        dev = lin["nvml"]["devices"][0]
+        dev["compute_processes"][0]["used_memory"] = int(dev["memory"]["total"] * 0.9)
+        _, rows = run("nvidia.malware.scraper", FakeSystemSource(lin))
+        self.assertEqual([r["PID"] for r in rows], [dev["compute_processes"][0]["pid"]])
+
+    def test_unaccounted_windows_counters(self):
+        sc = windows_scenario()
+        _, rows = run("nvidia.malware.unaccounted", FakeSystemSource(sc))
+        self.assertEqual(rows[0]["Name"], "NVIDIA GeForce RTX 4050 Laptop GPU")
+        self.assertEqual(rows[0]["Unaccounted"], "0 B")
+        self.assertFalse(isinstance(rows[0]["Finding"], str))
+        sc["windows"]["gpu"]["adapters"]["0x00000000_0x00000001"]["dedicated"] += 2 << 30  # hidden 2 GiB
+        _, rows = run("nvidia.malware.unaccounted", FakeSystemSource(sc))
+        self.assertIn("belongs to no process", rows[0]["Finding"])
+
+
+@unittest.skipUnless(os.name == "nt", "Windows APIs")
+class WindowsApiTests(unittest.TestCase):
+    """The real Windows readers on this machine (no fakes)."""
+
+    def test_signature_embedded_catalog_and_tampered(self):
+        import shutil
+        from keto.live import windows as w
+        self.assertEqual(w.signature(os.path.join(os.environ["SystemRoot"], "explorer.exe"))["status"], "valid")
+        cat = w.signature(os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe"))
+        self.assertEqual((cat["status"], cat["kind"]), ("valid", "catalog"))
+        src = os.path.join(os.environ["SystemRoot"], "System32", "taskmgr.exe")
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "taskmgr.exe")
+            shutil.copyfile(src, copy)
+            self.assertEqual(w.signature(copy)["status"], "valid")
+            with open(copy, "r+b") as fh:
+                fh.seek(0x2000)
+                b = fh.read(1)
+                fh.seek(0x2000)
+                fh.write(bytes([b[0] ^ 0xFF]))
+            self.assertIn("BAD DIGEST", w.signature(copy)["status"])
+            unsigned = os.path.join(d, "plain.exe")
+            with open(unsigned, "wb") as fh:
+                fh.write(b"MZ" + b"\x00" * 510)
+            self.assertNotEqual(w.signature(unsigned)["status"], "valid")
+
+    def test_command_line_adapters_regions(self):
+        from keto.live import windows as w
+        cmd = w.command_line(os.getpid())
+        self.assertIn("python", (cmd or "").lower())
+        ads = w.adapters()
+        self.assertTrue(all(a["luid"].startswith("0x") for a in ads))
+        h, regs = w.regions(os.getpid())
+        try:
+            img = [r for r in regs if r["type"] == "image" and r["path"].lower().endswith("python.exe")]
+            self.assertTrue(img)
+            data, bad = w.read_region(h, img[0]["start"], 2)
+            self.assertEqual((data, bad), (b"MZ", 0))
+        finally:
+            w.close_handle(h)
 
     def test_gpuprocs_snapshot_replay(self):
         rec = RecordingSource(FakeSystemSource(windows_scenario()))

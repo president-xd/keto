@@ -44,6 +44,15 @@ class Memory(ctypes.Structure):
     _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
 
+class Memory_v2(ctypes.Structure):
+    """nvmlMemory_v2_t: ``used`` excludes the driver/firmware-reserved framebuffer, which v1 counts as used."""
+    _fields_ = [("version", ctypes.c_uint), ("total", ctypes.c_ulonglong), ("reserved", ctypes.c_ulonglong),
+                ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+MEMORY_V2_VERSION = ctypes.sizeof(Memory_v2) | (2 << 24)  # NVML_STRUCT_VERSION(Memory, 2)
+
+
 class Bar1Memory(ctypes.Structure):
     _fields_ = [("bar1Total", ctypes.c_ulonglong), ("bar1Free", ctypes.c_ulonglong), ("bar1Used", ctypes.c_ulonglong)]
 
@@ -232,9 +241,14 @@ def _device(nv: NVML, index: int, h, all_handles) -> Dict[str, Any]:
     e = nv.call("nvmlDeviceGetPciInfo_v3", h, ctypes.byref(pci))
     d["pci"] = e if e else {"bus_id": pci.busId.decode(), "domain": pci.domain, "bus": pci.bus, "device": pci.device,
                             "device_id": "0x%08x" % pci.pciDeviceId, "subsystem_id": "0x%08x" % pci.pciSubSystemId}
-    mem = Memory()
-    e = nv.call("nvmlDeviceGetMemoryInfo", h, ctypes.byref(mem))
-    d["memory"] = e if e else {"total": mem.total, "free": mem.free, "used": mem.used}
+    m2 = Memory_v2()
+    m2.version = MEMORY_V2_VERSION
+    if hasattr(nv.lib, "nvmlDeviceGetMemoryInfo_v2") and not nv.call("nvmlDeviceGetMemoryInfo_v2", h, ctypes.byref(m2)):
+        d["memory"] = {"total": m2.total, "free": m2.free, "used": m2.used, "reserved": m2.reserved}
+    else:
+        mem = Memory()
+        e = nv.call("nvmlDeviceGetMemoryInfo", h, ctypes.byref(mem))
+        d["memory"] = e if e else {"total": mem.total, "free": mem.free, "used": mem.used}
     bar1 = Bar1Memory()
     e = nv.call("nvmlDeviceGetBAR1MemoryInfo", h, ctypes.byref(bar1))
     d["bar1"] = e if e else {"total": bar1.bar1Total, "free": bar1.bar1Free, "used": bar1.bar1Used}

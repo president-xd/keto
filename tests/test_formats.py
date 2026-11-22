@@ -212,6 +212,37 @@ class FileFormatTests(unittest.TestCase):
             lin = bytes(rnd.getrandbits(8) for _ in range(w * h))
             self.assertEqual(imaging.deswizzle(imaging.swizzle(lin, w, h, bh), w, h, bh), lin)
 
+    def test_autocorrelation_width(self):
+        from keto.testing.synth import _surface_pixels
+        for w, h in ((1000, 128), (1366, 200), (37, 300), (192, 96)):
+            self.assertEqual(imaging.autocorr_width(_surface_pixels(w, h, 30)), w)
+        rnd = random.Random(7)
+        self.assertIsNone(imaging.autocorr_width(bytes(rnd.getrandbits(8) for _ in range(1 << 17))))
+        self.assertIsNone(imaging.autocorr_width(b"\x40\x40\x40\xff" * 65536))
+
+    def test_container_header_current_and_legacy(self):
+        from keto.formats import container as cmod
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "new.keto")
+            w = ContainerWriter(p, {"device": {"name": "t"}})
+            w.add_segment("vram", 0, b"abc")
+            w.close()
+            with open(p, "rb") as fh:
+                self.assertEqual(fh.read(8), b"KETOEVD\x01")
+            # a container written before the rename (legacy header) must still open and verify
+            data = bytearray(open(p, "rb").read())
+            data[:8] = cmod.LEGACY_MAGICS[0]
+            old = os.path.join(d, "old.vrm")
+            with open(old, "wb") as fh:
+                fh.write(data)
+            self.assertTrue(cmod.is_container(old))
+            with Container(old) as c:
+                self.assertEqual(c.layers()["vram"].read(0, 3), b"abc")
+                self.assertTrue(all(r["ok"] for r in c.verify()))
+            with open(old, "r+b") as fh:
+                fh.write(b"NOTAKETO")
+            self.assertFalse(cmod.is_container(old))
+
     def test_container_and_lime(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "c.keto")
@@ -235,6 +266,52 @@ class FileFormatTests(unittest.TestCase):
 
 
 class ScannerTests(unittest.TestCase):
+    def test_parallel_matches_serial(self):
+        """Multi-process scanning returns exactly the single-process hits, including matches that straddle the
+        boundaries between worker parts, for in-place and case-folding scanners and for container layers."""
+        from keto.framework import parallel
+        rnd = random.Random(11)
+        data = bytearray(rnd.getrandbits(8) for _ in range(6 << 20))
+        part = 1 << 20
+        for k, pos in enumerate((10, part - 3, 2 * part - 6, 3 * part + 100, 5 * part - 2)):
+            data[pos:pos + 12] = b"PAYLOAD-%04d" % k
+            data[pos + 40:pos + 52] = b"Stratum+TCP:"
+        scanners = [lambda: BytesScanner(b"PAYLOAD-"), lambda: RegexScanner(rb"PAYLOAD-(\d{4})", max_length=16),
+                    lambda: AnchoredScanner([b"PAYLOAD"], rb"PAYLOAD-\d+", after=16),
+                    lambda: AnchoredScanner([b"stratum+tcp:"], None, ignore_case=True)]
+        old = (parallel.PARALLEL_MIN, parallel.PART_SIZE, os.environ.get("KETO_WORKERS"))
+        with tempfile.TemporaryDirectory() as d:
+            raw = os.path.join(d, "img.raw")
+            with open(raw, "wb") as fh:
+                fh.write(data)
+            cont = os.path.join(d, "img.keto")
+            w = ContainerWriter(cont, {})
+            w.add_segment("vram", 0, bytes(data[:3 << 20]))
+            w.add_segment("vram", 3 << 20, bytes(data[3 << 20:]))
+            w.close()
+            from keto.framework.layers import FileLayer
+            layers = [FileLayer("raw", raw), Container(cont).layers()["vram"]]
+            try:
+                for layer in layers:
+                    for make in scanners:
+                        os.environ["KETO_WORKERS"] = "1"
+                        serial = sorted((o, v.group() if hasattr(v, "group") else v) for o, v in scan(layer, make()))
+                        os.environ["KETO_WORKERS"] = "3"
+                        parallel.PARALLEL_MIN, parallel.PART_SIZE = 0, part
+                        par = sorted((o, v.group() if hasattr(v, "group") else v) for o, v in scan(layer, make()))
+                        parallel.PARALLEL_MIN, parallel.PART_SIZE = old[0], old[1]
+                        self.assertEqual(len(serial), 5)
+                        self.assertEqual(par, serial)
+            finally:
+                parallel.PARALLEL_MIN, parallel.PART_SIZE = old[0], old[1]
+                if old[2] is None:
+                    os.environ.pop("KETO_WORKERS", None)
+                else:
+                    os.environ["KETO_WORKERS"] = old[2]
+                for layer in layers:
+                    layer.close()
+                parallel._shutdown()
+
     def test_chunk_boundaries(self):
         data = bytearray(200000)
         for pos in (0, 65530, 65536, 131070, 199990):

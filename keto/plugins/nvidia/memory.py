@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import re
 
-from keto.framework.exceptions import RequirementError
+from keto.formats import fatbin as fatbin_fmt
+from keto.formats import gpucode
+from keto.framework.exceptions import RequirementError, UnsupportedError
 from keto.framework.plugin import Plugin, Requirement
 from keto.framework.scanners import RegexScanner, scan
 from keto.framework.treegrid import Address, Bytes, Hex, TreeGrid, na
@@ -25,17 +27,43 @@ def pick_aspaces(ctx, selector):
     return out
 
 
+#: file / object signatures recognised at the start of a block
+MAGICS = [(b"\x89PNG\r\n\x1a\n", "PNG image"), (b"\xff\xd8\xff", "JPEG image"), (b"GIF87a", "GIF image"),
+          (b"GIF89a", "GIF image"), (b"PK\x03\x04", "ZIP archive"), (b"\x1f\x8b\x08", "gzip data"),
+          (b"\x28\xb5\x2f\xfd", "zstd frame"), (b"\x04\x22\x4d\x18", "LZ4 frame"), (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+          (b"Rar!\x1a\x07", "RAR archive"), (b"SQLite format 3\x00", "SQLite database"), (b"%PDF-", "PDF document"),
+          (b"-----BEGIN ", "PEM block"), (fatbin_fmt.FATBIN_MAGIC_BYTES, "CUDA fatbin"),
+          (fatbin_fmt.WRAPPER_MAGIC_BYTES, "__nv_fatbinwrap descriptor"), (gpucode.SPIRV_MAGIC_BYTES, "SPIR-V module"),
+          (gpucode.DXBC_MAGIC, "DXBC shader")]
+
+
+def _magic(data: bytes):
+    if data[:4] == b"\x7fELF":
+        return "ELF (CUDA cubin)" if data[18:20] == b"\xbe\x00" else "ELF"
+    if data[:2] == b"MZ" and len(data) >= 0x40:
+        e = int.from_bytes(data[0x3C:0x40], "little")
+        return "PE executable" if data[e:e + 4] == b"PE\x00\x00" else "MZ (DOS header)"
+    if data[:2] == b"\x55\xaa" and b"PCIR" in data[:0x400]:
+        return "option ROM"
+    return next((name for magic, name in MAGICS if data.startswith(magic)), None)
+
+
 def classify(data: bytes) -> str:
-    """Short content hint for a block of memory."""
+    """Short content hint for a block of memory (magic numbers, fills, SASS, text, entropy)."""
     if not data or data.count(0) == len(data):
         return "zero"
-    if data[:4] == b"\x7fELF":
-        return "ELF"
+    if data.count(data[0]) == len(data):
+        return "fill 0x%02x" % data[0]
+    if len(data) >= 8 and data[:4] * (len(data) // 4) == data[:len(data) - len(data) % 4]:
+        return "fill pattern %s" % data[:4].hex()
+    kind = _magic(data)
+    if kind:
+        return kind
     if sass.looks_like_code(data[:4096 - 4096 % 16]):
         return "SASS code"
-    pr = printable_ratio(data[:4096])
-    if pr > 0.9:
-        return "text"
+    text = data[:4096].rstrip(b"\x00")  # text followed by zero padding is still text
+    if printable_ratio(text) > 0.9:
+        return "PTX source" if b".version" in text and b".target" in text else "text"
     ent = entropy(data[:65536])
     if ent > 7.5:
         return "high-entropy (compressed/encrypted/random)"
@@ -45,6 +73,28 @@ def classify(data: bytes) -> str:
 
 
 AS_REQ = Requirement("aspace", str, None, "address space name (as_<pdb>) or page directory base in hex")
+
+
+def block_runs(layer, g: int, owner: dict):
+    """``[start, end, state, max_entropy]`` runs of consecutive ``g``-byte blocks with the same state: the owners
+    in ``owner`` (block index -> set of names), else unmapped-zero / unmapped-data."""
+    run = None
+    for start, length in layer.ranges():
+        for off in range(start - start % g, start + length, g):
+            data = layer.read(off, g, pad=True)
+            o = owner.get(off // g)
+            st = ",".join(sorted(o)) if o else ("unmapped-zero" if data.count(0) == len(data) else "unmapped-data")
+            ent = entropy(data) if st == "unmapped-data" else None
+            if run and run[2] == st and run[1] == off:
+                run[1] = off + g
+                if ent is not None:
+                    run[3] = max(run[3] or 0.0, ent)
+                continue
+            if run:
+                yield run
+            run = [off, off + g, st, ent]
+    if run:
+        yield run
 
 
 class AddressSpaces(Plugin):
@@ -111,6 +161,9 @@ class PtWalk(Plugin):
     REQUIREMENTS = [AS_REQ, Requirement("limit", int, 2000, "maximum rows")]
 
     def run(self):
+        if self.opts["limit"] < 1:
+            raise RequirementError("--limit must be at least 1")
+
         def rows():
             n = 0
             for a in pick_aspaces(self.ctx, self.opts["aspace"]):
@@ -142,19 +195,22 @@ class MemMap(Plugin):
     DESCRIPTION = ("Shows the page-level virtual-to-physical map of a GPU address space and can dump all of its "
                    "readable memory to a file (with a map file giving each page's offset).")
     METHOD = ("Lists every leaf PTE (VA, PA, size, aperture); --dump reads each readable page through the "
-              "GMMU layer and writes pages back to back, recording the file offset per page.")
+              "GMMU layer and writes pages back to back to <aspace>.dmp, and writes <aspace>.map with one line per "
+              "page: VA, PA, aperture, size, flags and the page's offset in the .dmp file ('-' if not dumped).")
     ANALOG = "windows.memmap / linux.proc.Maps --dump"
-    REQUIREMENTS = [AS_REQ, Requirement("dump", bool, False, "write mapped memory to <aspace>.dmp in the output dir")]
+    REQUIREMENTS = [AS_REQ, Requirement("dump", bool, False, "write mapped memory to <aspace>.dmp (and the page map "
+                                                             "<aspace>.map) in the output dir")]
 
     def run(self):
         spaces = pick_aspaces(self.ctx, self.opts["aspace"])
 
         def rows():
             for a in spaces:
-                fh = None
+                fh = mh = None
                 if self.opts["dump"]:
-                    path = self.ctx.output_path(a.name + ".dmp")
-                    fh = open(path, "wb")
+                    fh = open(self.ctx.output_path(a.name + ".dmp"), "wb")
+                    mh = open(self.ctx.output_path(a.name + ".map"), "w", encoding="utf-8")
+                    mh.write("# %s page map: va pa aperture size flags dmp_offset\n" % a.name)
                 file_off = 0
                 try:
                     for m in a.mappings():
@@ -164,10 +220,14 @@ class MemMap(Plugin):
                             fh.write(a.layer.read(m.va, m.size))
                             off = Hex(file_off)
                             file_off += m.size
+                        if mh:
+                            mh.write("0x%x 0x%x %s 0x%x %s %s\n" % (m.va, m.pa, m.aperture, m.size, m.flags(),
+                                                                   "0x%x" % int(off) if readable else "-"))
                         yield 0, (a.name, Address(m.va), Address(m.pa), m.aperture, Hex(m.size), m.flags(), readable, off)
                 finally:
-                    if fh:
-                        fh.close()
+                    for h in (fh, mh):
+                        if h:
+                            h.close()
         return TreeGrid([("AddressSpace", str), ("VA", Address), ("PA", Address), ("Aperture", str), ("Size", Hex),
                          ("Flags", str), ("Readable", bool), ("FileOffset", Hex)], rows())
 
@@ -198,10 +258,11 @@ class VaMap(Plugin):
                         tag.append((d["qmd_va"], "launch descriptor (QMD)"))
                     elif ev.kind == "semaphore":
                         tag.append((d["address"], "semaphore"))
-                    elif ev.kind == "copy" and d["src_type"] == "VIRTUAL":
-                        tag.append((d["src"], "copy source"))
-                    elif ev.kind == "copy" and d["dst_type"] == "VIRTUAL":
-                        tag.append((d["dst"], "copy destination"))
+                    elif ev.kind == "copy":  # either end, or both, may be virtual
+                        if d["src_type"] == "VIRTUAL":
+                            tag.append((d["src"], "copy source"))
+                        if d["dst_type"] == "VIRTUAL":
+                            tag.append((d["dst"], "copy destination"))
                     elif ev.kind == "inline":
                         tag.append((d["dst"], "inline upload target"))
         for ln in discovery.launches(self.ctx):
@@ -231,9 +292,10 @@ class PhysMap(Plugin):
     CATEGORY = "nvidia.memory"
     DESCRIPTION = ("Maps physical VRAM ownership: which blocks are page tables, instance blocks, mapped by which "
                    "address spaces, or unmapped (free) - and whether unmapped blocks still hold data.")
-    METHOD = ("Builds a per-block index from the page-table walk (table pages and leaf targets) and instance "
-              "block scan, then samples every block of --granularity bytes for zero/non-zero content and entropy; "
-              "consecutive blocks with the same state are merged into one row.")
+    METHOD = ("Builds a per-block index from the page-table walk (table pages and leaf targets), the instance "
+              "block scan (with each channel's VRAM USERD page) and the runlists, then samples every block of "
+              "--granularity bytes (a multiple of 4K) for zero/non-zero content and entropy; consecutive blocks with "
+              "the same state are merged into one row.")
     ANALOG = "windows.bigpools / windows.poolscanner (physical view)"
     REQUIREMENTS = [Requirement("granularity", "size", 0x10000, "block size (default 64K)"),
                     Requirement("unmapped_only", bool, False, "only show unmapped blocks that contain data")]
@@ -241,44 +303,34 @@ class PhysMap(Plugin):
     def run(self):
         vram = self.ctx.require_vram()
         g = self.opts["granularity"]
+        if g < 0x1000 or g % 0x1000:
+            raise RequirementError("--granularity must be a positive multiple of 4K")
         owner = {}
-        for ib in discovery.instance_blocks(self.ctx):
-            owner.setdefault(ib.pa // g, set()).add("instance-block")
+
+        def own(start, size, what):
+            for blk in range(start // g, (start + max(size, 1) - 1) // g + 1):
+                owner.setdefault(blk, set()).add(what)
+
+        ibs = discovery.instance_blocks(self.ctx)
+        for ib in ibs:
+            own(ib.pa, 0x1000, "instance-block")
+            if ib.userd_aperture == VID and ib.userd_addr:  # live channel control pages, not remanence
+                own(ib.userd_addr, self.ctx.profile.userd.get("size", 0x200), "userd")
+        try:
+            for rl in discovery.runlists(self.ctx):
+                own(rl.pa, rl.end - rl.pa, "runlist")
+        except UnsupportedError:
+            pass
         for a in discovery.address_spaces(self.ctx):
             for e in a.walker.events():
                 if e.entry_pa is not None:
                     owner.setdefault(e.entry_pa // g, set()).add("page-table")
             for m in a.mappings():
                 if m.aperture == VID:
-                    for blk in range(m.pa // g, (m.pa + m.size - 1) // g + 1):
-                        owner.setdefault(blk, set()).add("mapped:" + a.name)
-
-        def state(blk, data):
-            o = owner.get(blk)
-            if o:
-                return ",".join(sorted(o))
-            return "unmapped-zero" if data.count(0) == len(data) else "unmapped-data"
-
-        def rows():
-            run = None
-            for start, length in vram.ranges():
-                for off in range(start - start % g, start + length, g):
-                    data = vram.read(off, g, pad=True)
-                    st = state(off // g, data)
-                    ent = entropy(data) if st == "unmapped-data" else None
-                    if run and run[2] == st and run[1] == off:
-                        run[1] = off + g
-                        if ent is not None:
-                            run[3] = max(run[3] or 0.0, ent)
-                        continue
-                    if run:
-                        yield run
-                    run = [off, off + g, st, ent]
-            if run:
-                yield run
+                    own(m.pa, m.size, "mapped:" + a.name)
 
         def out():
-            for s, e, st, ent in rows():
+            for s, e, st, ent in block_runs(vram, g, owner):
                 if self.opts["unmapped_only"] and st != "unmapped-data":
                     continue
                 yield 0, (Address(s), Address(e - 1), human_size(e - s), st,
@@ -291,32 +343,44 @@ class Residual(Plugin):
     NAME = "nvidia.residual"
     CATEGORY = "nvidia.memory"
     DESCRIPTION = ("Lists data left in VRAM that no page table maps (freed allocations: GPU memory remanence), "
-                   "classified by content, and can dump each region.")
-    METHOD = ("Uses the nvidia.physmap ownership index at 4 KiB granularity; contiguous unmapped non-zero pages "
-              "form regions, classified by magic numbers, SASS density, printable ratio and entropy.")
+                   "classified by content, and can dump each region. On a CUDA residual capture (acquire --method "
+                   "cuda) every non-zero part of the captured allocations is residual data; Start is then the "
+                   "allocation's GPU virtual address.")
+    METHOD = ("Uses the nvidia.physmap ownership index at 4 KiB granularity (page tables, mappings, instance "
+              "blocks, USERD pages and runlists are owned); contiguous unmapped non-zero pages form regions, "
+              "classified at their first non-zero 16-byte line by magic numbers (ELF/cubin, PE, PNG, JPEG, GIF, ZIP, "
+              "gzip, zstd, LZ4 frame, 7z, RAR, SQLite, PDF, PEM, fatbin, SPIR-V, DXBC, option ROM), fills, SASS "
+              "density, printable ratio (trailing zeros ignored; PTX recognised) and entropy.")
     ANALOG = "windows.mftscan.ResidentData (recover data the OS no longer tracks)"
     REQUIREMENTS = [Requirement("dump", bool, False, "write each region to the output dir"),
                     Requirement("min_size", "size", 1, "ignore regions smaller than this")]
 
     def run(self):
-        grid = PhysMap(self.ctx, {"granularity": 0x1000, "unmapped_only": True}).run()
-        vram = self.ctx.require_vram()
+        if self.opts["min_size"] < 1:
+            raise RequirementError("--min-size must be at least 1")
+        if self.ctx.vram is None and "residual" in self.ctx.layers:
+            layer = self.ctx.layers["residual"]  # nothing in a residual capture is owned
+            regions = [(s, e, round(ent, 2)) for s, e, st, ent in block_runs(layer, 0x1000, {})
+                       if st == "unmapped-data"]
+        else:
+            grid = PhysMap(self.ctx, {"granularity": 0x1000, "unmapped_only": True}).run()
+            layer = self.ctx.require_vram()
+            regions = [(int(start), int(end) + 1, ent) for _, (start, end, size, st, ent) in grid.rows]
 
         def rows():
-            for _, (start, end, size, st, ent) in grid.rows:
-                length = int(end) - int(start) + 1
+            for start, end, ent in regions:
+                length = end - start
                 if length < self.opts["min_size"]:
                     continue
-                data = vram.read(int(start), min(length, 1 << 20), pad=True)
-                first = data.lstrip(b"\x00")
-                lead = len(data) - len(first)
+                data = layer.read(start, min(length, 1 << 20), pad=True)
+                lead = (len(data) - len(data.lstrip(b"\x00"))) & ~0xF  # keep the whole first 16-byte line
                 path = na("")
                 if self.opts["dump"]:
-                    path = self.ctx.output_path("residual_%x.bin" % int(start))
+                    path = self.ctx.output_path("residual_%x.bin" % start)
                     with open(path, "wb") as fh:
-                        fh.write(vram.read(int(start), length, pad=True))
-                yield 0, (Address(start), human_size(length), classify(first[:65536]), ent,
-                          Bytes(first[:64]), Address(int(start) + lead), path)
+                        fh.write(layer.read(start, length, pad=True))
+                yield 0, (Address(start), human_size(length), classify(data[lead:lead + 65536]), ent,
+                          Bytes(data[lead:lead + 64]), Address(start + lead), path)
         return TreeGrid([("Start PA", Address), ("Size", str), ("Content", str), ("Entropy", float),
                          ("Preview", Bytes), ("FirstData", Address), ("Dumped", str)], rows())
 
@@ -362,7 +426,12 @@ class VaRegexScan(Plugin):
     def run(self):
         if not self.opts["pattern"]:
             raise RequirementError("--pattern is required")
-        rx = re.compile(self.opts["pattern"].encode(), re.DOTALL)
+        if self.opts["max_length"] < 1:
+            raise RequirementError("--max-length must be at least 1")
+        try:
+            rx = re.compile(self.opts["pattern"].encode(), re.DOTALL)
+        except re.error as exc:
+            raise RequirementError("invalid --pattern: %s" % exc)
 
         def rows():
             for a in pick_aspaces(self.ctx, self.opts["aspace"]):
@@ -402,34 +471,29 @@ class Strings(Plugin):
     NAME = "nvidia.strings"
     CATEGORY = "nvidia.memory"
     DESCRIPTION = ("Tells you which GPU address space / virtual address (or which structure) each string in VRAM "
-                   "belongs to; reads a `strings -t d` style file or extracts strings itself.")
+                   "belongs to; reads a `strings -t d` style file or extracts strings itself. On a CUDA residual "
+                   "capture (no page tables) it lists the strings of the captured allocations by GPU VA.")
     METHOD = ("Builds a physical->virtual reverse index of every GPU address space and resolves each string's "
               "physical offset; unmapped offsets are labelled with the structure they fall in (instance block, "
-              "cubin, residual).")
+              "cubin carved in place, fatbin, residual).")
     ANALOG = "windows.strings"
     REQUIREMENTS = [Requirement("strings_file", str, None, "file of '<decimal offset> <string>' lines"),
                     Requirement("min_length", int, 8, "minimum length when extracting strings"),
                     Requirement("limit", int, 5000, "maximum strings")]
 
     def run(self):
+        if self.opts["min_length"] < 1 or self.opts["limit"] < 1:
+            raise RequirementError("--min-length and --limit must be at least 1")
+        if self.ctx.vram is None and "residual" in self.ctx.layers:
+            return self._residual(self.ctx.layers["residual"])
         vram = self.ctx.require_vram()
         inst = {ib.pa: ib for ib in discovery.instance_blocks(self.ctx)}
-        cub = [(c.offset, c.offset + c.size) for c in discovery.cubins(self.ctx) if c.layer == vram.name]
-
-        def entries():
-            if self.opts["strings_file"]:
-                if not os.path.exists(self.opts["strings_file"]):
-                    raise RequirementError("strings file not found")
-                with open(self.opts["strings_file"], "r", encoding="utf-8", errors="replace") as fh:
-                    for line in fh:
-                        parts = line.strip().split(None, 1)
-                        if len(parts) == 2 and parts[0].isdigit():
-                            yield int(parts[0]), parts[1]
-            else:
-                for off, data, payload in vram.iter_chunks(4 << 20, 256):
-                    for o, enc, text in iter_strings(data, self.opts["min_length"], utf16=False):
-                        if o < payload:
-                            yield off + o, text
+        # physical extents only: cubins carved in place, and whole fatbins (their entries' offsets and
+        # decompressed sizes are not physical ranges)
+        cub = [(c.offset, c.offset + c.size, "cubin") for c in discovery.cubins(self.ctx)
+               if c.layer == vram.name and c.source == "scan"]
+        cub += [(f["offset"], f["offset"] + f["fatbin"].total_size, "fatbin") for f in discovery.fatbins(self.ctx)
+                if f["layer"] == vram.name]
 
         def where(pa):
             hits = discovery.reverse_lookup_all(self.ctx, pa)
@@ -437,14 +501,153 @@ class Strings(Plugin):
                 return "; ".join("%s:0x%x" % (a.name, va) for a, va, _ in hits)
             if (pa & ~0xFFF) in inst:
                 return "instance block 0x%x" % (pa & ~0xFFF)
-            for s, e in cub:
+            for s, e, kind in cub:
                 if s <= pa < e:
-                    return "cubin @0x%x" % s
+                    return "%s @0x%x" % (kind, s)
             return "unmapped (residual)"
 
         def rows():
-            for i, (pa, text) in enumerate(entries()):
+            for i, (pa, text) in enumerate(self._entries(vram)):
                 if i >= self.opts["limit"]:
                     break
                 yield 0, (Address(pa), where(pa), text[:200])
         return TreeGrid([("PA", Address), ("Owner", str), ("String", str)], rows())
+
+    def _entries(self, layer):
+        if self.opts["strings_file"]:
+            if not os.path.exists(self.opts["strings_file"]):
+                raise RequirementError("strings file not found")
+            with open(self.opts["strings_file"], "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.strip().split(None, 1)
+                    if len(parts) == 2 and parts[0].isdigit():
+                        yield int(parts[0]), parts[1]
+        else:
+            for off, data, payload in layer.iter_chunks(4 << 20, 256):
+                for o, enc, text in iter_strings(data, self.opts["min_length"], utf16=False):
+                    if o < payload:
+                        yield off + o, text
+
+    def _residual(self, layer):
+        """A CUDA residual capture holds no page tables: every string is residual data at a GPU VA."""
+        def rows():
+            for i, (va, text) in enumerate(self._entries(layer)):
+                if i >= self.opts["limit"]:
+                    break
+                yield 0, (Address(va), "residual allocation (GPU VA)", text[:200])
+        return TreeGrid([("PA", Address), ("Owner", str), ("String", str)], rows())
+
+
+class FillScan(Plugin):
+    NAME = "nvidia.malware.fillscan"
+    CATEGORY = "nvidia.malware"
+    DESCRIPTION = ("Finds large regions of VRAM filled with one repeated non-zero value (0xFF, 0x11, a repeated 4/8-byte "
+                   "word): the marker remanence scrapers write into nearly all free memory before reading back what "
+                   "changed, or memory squatting. Reports each run with the GPU address spaces that map it.")
+    METHOD = ("Checks every 64 KiB block for a single repeating period-1, -4 or -8 pattern that is not zero, merges "
+              "adjacent blocks with the same pattern, and reports runs of at least --min-size with their owners "
+              "(reverse page-table lookup).")
+    ANALOG = "(GPU-specific: residual-data scraping)"
+    REQUIREMENTS = [Requirement("min_size", "size", 1 << 20, "smallest run reported (default 1M)")]
+    BLOCK = 0x10000
+
+    @staticmethod
+    def _pattern(d: bytes):
+        for period in (1, 4, 8):
+            unit = d[:period]
+            if unit.count(0) == period:
+                continue  # an all-zero unit is no marker, but a longer period may start with zero bytes (00 00 80 3F)
+            if unit * (len(d) // period) == d:
+                return unit
+        return None
+
+    def run(self):
+        if self.opts["min_size"] < 1:
+            raise RequirementError("--min-size must be at least 1")
+        layer = self.ctx.primary
+        blk = self.BLOCK
+        runs = []
+        for start, length in layer.ranges():
+            cur = None
+            for off in range(start, start + length - blk + 1, blk):
+                pat = self._pattern(layer.read(off, blk))
+                if pat is not None and cur and cur[1] == off and cur[2] == pat:
+                    cur[1] = off + blk
+                elif pat is not None:
+                    cur = [off, off + blk, pat]
+                    runs.append(cur)
+                else:
+                    cur = None
+
+        def rows():
+            for s, e, pat in runs:
+                if e - s < self.opts["min_size"]:
+                    continue
+                owners = "-"
+                if layer is self.ctx.vram:
+                    hits = discovery.reverse_lookup_all(self.ctx, s)
+                    owners = "; ".join("%s:0x%x" % (a.name, va) for a, va, _ in hits) or "unmapped"
+                yield 0, (Address(s), e - s, pat.hex(), owners, "uniform fill of %s (%s)" % (pat.hex(),
+                                                                                         human_size(e - s)))
+        return TreeGrid([("Start", Address), ("Size", int), ("Pattern", str), ("MappedAt", str), ("Finding", str)],
+                        rows())
+
+
+class HostPages(Plugin):
+    NAME = "nvidia.malware.hostpages"
+    CATEGORY = "nvidia.malware"
+    DESCRIPTION = ("For every GPU mapping of host memory (system-memory PTEs in VRAM page tables), finds who owns "
+                   "the host page in a host RAM image of the same machine: a process (and where it maps it), the "
+                   "kernel image, or kernel memory no process maps. GPU access to kernel text/data or to another "
+                   "program's pages is the inconsistent-mapping / GPU keylogger pattern.")
+    METHOD = ("Collects SYSTEM_COHERENT/NON_COHERENT PTEs from every GPU address space, then walks every task's "
+              "user page tables in the host image (BTF-typed; --host-image with a kcore container, or --btf/"
+              "--kallsyms) to build page -> (pid, comm, va) and classifies unowned pages against _text.._end. A task "
+              "list broken in a smeared image gives a 'walk error' row and the owners of the tasks reached; unowned "
+              "pages are then only low severity.")
+    ANALOG = "(GPU-specific: GPU-to-host mapping ownership cross-view)"
+    REQUIREMENTS = None  # set below (host-memory options)
+
+    def run(self):
+        from keto.hostmem import pageowners
+        from keto.hostmem.session import kernel_memory
+        km = kernel_memory(self.ctx, self.opts)
+        maps = []
+        for a in discovery.address_spaces(self.ctx):
+            for m in a.mappings():
+                if m.aperture in (SYS_COH, SYS_NCOH):
+                    for off in range(0, m.size, 0x1000):
+                        maps.append((a.name, m.va + off, m.pa + off, m))
+        errors = []  # a task list broken in a smeared image: owners of the tasks reached are still reported
+        owners = pageowners.owners(km, [pa for _, _, pa, _ in maps], errors)
+        rng = pageowners.kernel_image_range(km)
+
+        def rows():
+            for e in errors:
+                yield 0, (na(""), Address(0), Address(0), na(""), na("walk error"), na(""), "info",
+                          e + " (mappings of the tasks not reached are not counted)")
+            for name, va, pa, m in maps:
+                os_ = owners.get(pa & ~0xFFF, [])
+                cls = pageowners.classify(km, pa & ~0xFFF, os_)
+                if rng and rng[0] <= pa < rng[1]:
+                    sev, why = "high", "GPU can access kernel image text/data"
+                elif not os_ and errors:  # its owner may be one of the tasks the walk did not reach
+                    sev, why = "low", "GPU maps host memory no reached process maps (task walk incomplete)"
+                elif not os_:
+                    sev, why = "medium", "GPU maps kernel memory that no process maps"
+                elif len({o.pid for o in os_}) > 1:
+                    sev, why = "medium", "page shared by several processes is GPU-accessible"
+                else:
+                    sev, why = "info", ""
+                yield 0, (name, Address(va), Address(pa), "rw" if not m.readonly else "ro", cls,
+                          ", ".join("0x%x" % o.va for o in os_[:4]) or na(""), sev, why or na(""))
+        return TreeGrid([("AddressSpace", str), ("GPU VA", Address), ("Host PA", Address), ("GPU access", str),
+                         ("Owner", str), ("Owner VA", str), ("Severity", str), ("Finding", str)], rows())
+
+
+def _host_reqs():
+    from keto.hostmem.session import HOST_REQS
+    return list(HOST_REQS)
+
+
+HostPages.REQUIREMENTS = _host_reqs()

@@ -17,7 +17,7 @@ collected verbatim in docs/research/NVIDIA_COMMAND_FACTS.md section 1:
     V04_00   384   "                                  64-bit PROGRAM_ADDRESS_LOWER/UPPER (moved)
     V04_01   384   "                                  "
     V05_00   384   minor 467:464, major 471:468      PROGRAM_ADDRESS_*_SHIFTED4 (address >> 4)
-    V05_01   384   (detected; multi-sub-task layout reported raw)
+    V05_01   384   "                                  per sub-task (SUB_TASK_*(i), 416-bit stride, up to 5)
 
 The version is read from the descriptor itself (the driver's choice per class is
 not published), so decoding never depends on guessing the GPU generation.
@@ -98,12 +98,29 @@ def _layouts():
            "addr_shift": 6, "size_shift": 4}
     L["v05_00"] = {"size": 384, "major": 5, "minor": 0, "fields": f5, "cb": cb5, "prog": "address_shift4",
                    "smem_shift": 7, "local_shift": 4}
+    # V05_01 (clcdc0qmd.h / clcec0qmd.h): a task of NUM_SUB_TASKS_PER_TASK (157:154) sub-tasks; every launch field
+    # is a SUB_TASK_*(i) array with a 416-bit stride (sub-task 0 below), each sub-task has two constant banks
+    # (VALID stride 202 bits, address/size stride 64 bits); the release semaphore is shared by the task
+    f51 = {"minor": (467, 464), "major": (471, 468), "qmd_type": (153, 151), "sub_tasks": (157, 154),
+           "prog_lo": (799, 768), "prog_hi": (820, 800), "grid_w": (1151, 1120), "grid_h": (1167, 1152),
+           "grid_d": (1183, 1168), "block_x": (847, 832), "block_y": (863, 848), "block_z": (871, 864),
+           "smem": (906, 896), "regs": (880, 872), "barriers": (885, 881),
+           "rel0_lo": (511, 480), "rel0_hi": (536, 512), "rel0_payload_lo": (575, 544),
+           "rel0_payload_hi": (607, 576), "rel0_struct": (290, 289), "rel0_enable": (288, 288)}
+    cb51 = {"valid": (886, 202), "lo": ((991, 960), 64), "hi": ((1010, 992), 64), "size": ((1023, 1011), 64),
+            "addr_shift": 6, "size_shift": 4, "count": 2}
+    L["v05_01"] = {"size": 384, "major": 5, "minor": 1, "fields": f51, "cb": cb51, "prog": "address_shift4",
+                   "smem_shift": 7,
+                   "sub_task": {"stride": 416, "max": 5,
+                                "fields": ("prog_lo", "prog_hi", "grid_w", "grid_h", "grid_d", "block_x", "block_y",
+                                           "block_z", "smem", "regs", "barriers")}}
     return L
 
 
 LAYOUTS: Dict[str, dict] = _layouts()
-#: versions recognised by their header but not decoded (field layout differs per sub-task)
-RAW_ONLY = {"v05_01": {"size": 384, "major": 5, "minor": 1}}
+#: versions recognised by their header but not decoded (none left: V05_01 sub-tasks are decoded)
+RAW_ONLY: Dict[str, dict] = {}
+QMD_TYPES = {0: "queue", 1: "grid null", 2: "grid CTA", 3: "grid GPC CGA", 4: "grid GPU CGA", 5: "grid GPU GPC CGA"}
 EXPECT = {name: {"major": l["major"], "minor": l["minor"]} for name, l in LAYOUTS.items()}
 CLASS_DEFAULT = {  # QMD version NVK writes per compute class family (for encoding test data only)
     "kepler_a": "v00_06", "kepler_b": "v01_07", "maxwell": "v01_07", "pascal": "v02_01", "volta": "v02_02",
@@ -117,6 +134,23 @@ _V05_BYTE = {(l["major"] << 4) | l["minor"]: n for n, l in list(LAYOUTS.items())
 
 def _get(blob_int: int, hi: int, lo: int) -> int:
     return (blob_int >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+
+# hardware launch limits shared by every generation (CUDA C programming guide, "Technical specifications per
+# compute capability"): block 1024 x 1024 x 64 and 1024 threads, grid (2^31-1) x 65535 x 65535, 255 registers per
+# thread, 16 named barriers, at most 228 KiB shared memory per block, 64 KiB constant banks, 57-bit virtual addresses
+MAX_THREADS, MAX_BLOCK = 1024, (1024, 1024, 64)
+MAX_GRID = ((1 << 31) - 1, 65535, 65535)
+MAX_REGISTERS, MAX_BARRIERS, MAX_SHARED, MAX_CBUF, MAX_VA = 255, 16, 228 << 10, 64 << 10, 1 << 57
+
+
+def _shape_ok(grid, block) -> bool:
+    threads = 1
+    for b, lim in zip(block, MAX_BLOCK):
+        if not 1 <= b <= lim:
+            return False
+        threads *= b
+    return threads <= MAX_THREADS and all(1 <= g <= lim for g, lim in zip(grid, MAX_GRID))
 
 
 def detect(raw: bytes) -> Optional[str]:
@@ -144,8 +178,34 @@ def signature(version: str):
 
 class Qmd:
     def __init__(self, version: str, raw: bytes, fields: Dict[str, int], cbufs: List[Tuple[int, int, int]],
-                 layout: dict):
+                 layout: dict, sub_task: int = 0):
         self.version, self.raw, self.fields, self._cbufs, self.layout = version, raw, fields, cbufs, layout
+        #: index of the sub-task this view describes (V05_01; 0 for every other version)
+        self.sub_task = sub_task
+
+    @property
+    def sub_tasks(self) -> List["Qmd"]:
+        """One view per sub-task (V05_01): its own program, grid, block, registers, shared memory and constant
+        banks; the release semaphore is the task's. Other versions: ``[self]``."""
+        st = self.layout.get("sub_task")
+        if not st:
+            return [self]
+        n = max(1, min(self.fields.get("sub_tasks", 0), st["max"]))
+        blob = int.from_bytes(self.raw, "little")
+        views = [self]
+        for i in range(1, n):
+            fields = dict(self.fields)
+            for k in st["fields"]:
+                hi, lo = self.layout["fields"][k]
+                fields[k] = _get(blob, hi + i * st["stride"], lo + i * st["stride"])
+            views.append(Qmd(self.version, self.raw, fields, _cbufs(blob, self.layout["cb"], i * st["stride"]),
+                             self.layout, sub_task=i))
+        return views
+
+    @property
+    def qmd_type(self) -> Optional[str]:
+        t = self.fields.get("qmd_type")
+        return None if t is None else QMD_TYPES.get(t, "type %d" % t)
 
     # -- normalised accessors (identical meaning on every generation) --------
     @property
@@ -208,14 +268,31 @@ class Qmd:
         return None if region is None else region + (self.program_offset or 0)
 
     def plausible(self) -> bool:
-        bx, by, bz = self.block
-        threads = bx * by * bz
-        if not (1 <= threads <= 1024 and all(self.grid)):
+        """Within the hardware limits of every generation (CUDA programming guide, compute capability table)."""
+        if not _shape_ok(self.grid, self.block):
+            return False
+        if not 1 <= self.registers <= MAX_REGISTERS or self.barriers > MAX_BARRIERS:
+            return False
+        if self.shared_memory > MAX_SHARED or any(size > MAX_CBUF for _, _, size in self._cbufs):
             return False
         if self.layout["prog"] == "offset":
             return (self.program_offset or 0) % 16 == 0
         addr = self.program_address
-        return bool(addr) and addr % 16 == 0
+        return bool(addr) and addr % 16 == 0 and addr < MAX_VA
+
+
+def quick_plausible(raw: bytes, version: Optional[str] = None) -> bool:
+    """Cheap pre-check before ``decode`` (used when scanning gigabytes): only the block, grid and program fields
+    are extracted. Rejects what ``Qmd.plausible`` would reject; never rejects a descriptor it would accept."""
+    if version in (None, "auto"):
+        version = detect(raw)
+    layout = LAYOUTS.get(version or "")
+    if layout is None or len(raw) < layout["size"]:
+        return False
+    f = layout["fields"]
+    blob = int.from_bytes(bytes(raw[:layout["size"]]), "little")
+    return _shape_ok([_get(blob, *f[k]) for k in ("grid_w", "grid_h", "grid_d")],
+                     [_get(blob, *f[k]) for k in ("block_x", "block_y", "block_z")])
 
 
 def decode(raw: bytes, version: Optional[str] = None) -> Optional[Qmd]:
@@ -227,22 +304,28 @@ def decode(raw: bytes, version: Optional[str] = None) -> Optional[Qmd]:
         return None
     blob = int.from_bytes(bytes(raw[:layout["size"]]), "little")
     fields = {k: _get(blob, hi, lo) for k, (hi, lo) in layout["fields"].items()}
-    cb = layout["cb"]
-    cbufs = []
-    for i in range(8):
+    return Qmd(version, bytes(raw[:layout["size"]]), fields, _cbufs(blob, layout["cb"]), layout)
+
+
+def _cbufs(blob: int, cb: dict, shift: int = 0) -> List[Tuple[int, int, int]]:
+    """Valid constant buffers ``(index, address, size)``; ``shift`` moves every field (V05_01 sub-tasks)."""
+    out = []
+    for i in range(cb.get("count", 8)):
         vbase, vstride = cb["valid"]
-        if not _get(blob, vbase + i * vstride, vbase + i * vstride):
+        v = vbase + i * vstride + shift
+        if not _get(blob, v, v):
             continue
         (lhi, llo), st = cb["lo"]
         (hhi, hlo), _ = cb["hi"]
         (shi, slo), _ = cb["size"]
-        addr = (_get(blob, lhi + i * st, llo + i * st) | (_get(blob, hhi + i * st, hlo + i * st) << 32)) \
-            << cb["addr_shift"]
-        cbufs.append((i, addr, _get(blob, shi + i * st, slo + i * st) << cb["size_shift"]))
-    return Qmd(version, bytes(raw[:layout["size"]]), fields, cbufs, layout)
+        o = i * st + shift
+        addr = (_get(blob, lhi + o, llo + o) | (_get(blob, hhi + o, hlo + o) << 32)) << cb["addr_shift"]
+        out.append((i, addr, _get(blob, shi + o, slo + o) << cb["size_shift"]))
+    return out
 
 
-def encode(version: str, fields: Dict[str, int], cbufs=()) -> bytes:
+def encode(version: str, fields: Dict[str, int], cbufs=(), sub_tasks=()) -> bytes:
+    """Build a QMD from field values; ``sub_tasks`` (V05_01) gives the fields of sub-tasks 1, 2, ..."""
     layout = LAYOUTS[version]
     blob = 0
 
@@ -253,6 +336,12 @@ def encode(version: str, fields: Dict[str, int], cbufs=()) -> bytes:
     for name, value in dict(fields, major=layout["major"], minor=layout["minor"]).items():
         if name in layout["fields"]:
             put(*layout["fields"][name], value)
+    st = layout.get("sub_task")
+    for i, sub in enumerate(sub_tasks, 1):
+        for name, value in sub.items():
+            if st and name in st["fields"]:
+                hi, lo = layout["fields"][name]
+                put(hi + i * st["stride"], lo + i * st["stride"], value)
     cb = layout["cb"]
     for i, addr, size in cbufs:
         vbase, vstride = cb["valid"]

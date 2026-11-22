@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from keto.framework.exceptions import RequirementError
 from keto.framework.plugin import Plugin, Requirement
 from keto.framework.treegrid import Address, Bytes, TreeGrid, na
 from keto.gpu import discovery
@@ -14,14 +15,19 @@ class ChanScan(Plugin):
     DESCRIPTION = ("Finds GPU channel instance blocks (the per-channel hardware context), including channels "
                    "that are no longer scheduled.")
     METHOD = ("Checks the RAMFC signature word (NV_PPBDMA_SIGNATURE_HW_VALID = 0xFACE at +0x10) of every "
-              "4 KiB-aligned page, then validates the page directory base (+0x200), GPFIFO base/size (+0x48) "
-              "and USERD pointer; USERD is read for the live GP_GET/GP_PUT.")
+              "4 KiB-aligned page, then validates the page directory base (+0x200; inside VRAM or a 52-bit host "
+              "address), the GPFIFO base/size (+0x48; reserved bits zero, saved GP_GET/GP_PUT inside the ring), "
+              "the USERD pointer (up to Turing; from Ampere on it comes from the runlist entry) and every "
+              "subcontext page directory marked valid; USERD is read for the live GP_GET/GP_PUT.")
     ANALOG = "windows.psscan / linux.psscan"
     REQUIREMENTS = [Requirement("all", bool, False, "also show signature hits that fail validation")]
 
     def run(self):
         ibs = discovery.instance_blocks(self.ctx, include_invalid=self.opts["all"])
         rlm = runlist_membership(self.ctx)
+        # Ampere+ RAMFC holds no USERD: only a runlist entry names it
+        no_userd = na("not in a runlist (RAMFC holds no USERD from Ampere on)"
+                      if "userd_lo" not in self.ctx.profile.ramfc else "no USERD pointer")
 
         def rows():
             for ib in ibs:
@@ -32,7 +38,8 @@ class ChanScan(Plugin):
                           aspace_name(a), Address(ib.gp_base_va), ib.gp_entries,
                           ib.gp_get() if ib.gp_get() is not None else na("USERD unreadable"),
                           ib.gp_put() if ib.gp_put() is not None else na("USERD unreadable"),
-                          Address(ib.userd_addr), ib.privileged, len(ib.subcontexts), ib.score, ib.valid)
+                          Address(ib.userd_addr) if ib.userd_addr and ib.userd_aperture else no_userd,
+                          ib.privileged, len(ib.subcontexts), ib.score, ib.valid)
         return TreeGrid([("InstanceBlock", Address), ("ChID", int), ("TSG", int), ("PDB Aperture", str),
                          ("PDB", Address), ("AddressSpace", str), ("GPFIFO VA", Address), ("Entries", int),
                          ("GP_GET", int), ("GP_PUT", int), ("USERD", Address), ("Privileged", bool),
@@ -146,6 +153,8 @@ class Timeslices(Plugin):
     REQUIREMENTS = [Requirement("factor", int, 8, "flag slices this many times above the default")]
 
     def run(self):
+        if self.opts["factor"] < 1:
+            raise RequirementError("--factor must be at least 1")
         default = 128 << 3
 
         def rows():

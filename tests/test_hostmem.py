@@ -161,6 +161,50 @@ class HostPluginTests(unittest.TestCase):
         hidden = [f for f in rep["findings"] if f["plugin"] == "wsl.dxgprocs"]
         self.assertEqual(len(hidden), 2)  # exited/hidden process X + the unlinked dxgprocess
 
+    def test_dxg_page_owners(self):
+        po = TRUTH["page_owners"]
+        g = self.run_plugin("wsl.dxgpageowners", {"image": self.keto})
+        rows = {r["Allocation"]: r for r in g.as_dicts()}
+        r = rows["0x%08x" % TRUTH["guest_page_alloc"]["handle"]]
+        self.assertEqual((r["Pages"], r["MappedByOwner"], r["AtCpuAddress"], r["Foreign"], r["KernelImage"]),
+                         (2, 2, 2, 1, 0))
+        self.assertIn("hider(300)", r["Attention"])
+        self.assertEqual(r["Severity"], "high")
+
+    def test_vram_host_page_owners(self):
+        """GPU system-memory PTEs in the synthetic VRAM image resolved against the synthetic kernel's RAM."""
+        from keto.testing.synth import build_all
+        vdir = os.path.join(self.tmp, "vram")
+        truth = build_all(vdir)["truth"]
+        g = self.run_plugin("nvidia.malware.hostpages", {"image": os.path.join(vdir, "synthetic.keto"),
+                                                          "host_image": self.keto})
+        rows = {int(r["Host PA"]): r for r in g.as_dicts()}
+        hpo = truth["host_page_owners"]
+        self.assertIn("bash(200)", rows[hpo["victim"]["host_pa"]]["Owner"])
+        self.assertEqual(rows[hpo["victim"]["host_pa"]]["Owner VA"], "0x7ffe00000000")
+        kt = rows[hpo["kernel_text"]["host_pa"]]
+        self.assertEqual((kt["Owner"], kt["Severity"]), ("KERNEL IMAGE (text/data)", "high"))
+        self.assertEqual(rows[truth["sysmem_mapping"]["host_pa"]]["Severity"], "medium")  # no process maps it
+
+    @unittest.skipUnless(os.path.exists("/proc/kcore") and hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "needs root on Linux")
+    def test_live_page_owner_walk(self):
+        from keto.hostmem import pageowners
+        from keto.hostmem.session import _live
+        k = _live()
+        with open("/proc/self/maps") as fh:
+            lo = int(fh.readline().split("-")[0], 16)
+        with open("/proc/self/pagemap", "rb") as fh:  # root sees PFNs
+            fh.seek((lo >> 12) * 8)
+            ent = int.from_bytes(fh.read(8), "little")
+        if not ent >> 63:
+            self.skipTest("first page of the executable not resident")
+        pa = (ent & ((1 << 55) - 1)) << 12
+        own = pageowners.owners(k, [pa])[pa]
+        with open("/proc/self/comm") as fh:
+            me = fh.read().strip()
+        self.assertTrue(any(o.comm == me and o.va == lo for o in own), own)
+
     def test_missing_symbols_is_a_clean_error(self):
         from keto.framework.exceptions import RequirementError
         with self.assertRaises(RequirementError):

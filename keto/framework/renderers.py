@@ -51,16 +51,28 @@ class Renderer:
 
 
 class QuickTextRenderer(Renderer):
-    """Tab separated, tree depth shown with leading ``*`` (Volatility style)."""
+    """Tab separated, tree depth shown with leading ``*`` (Volatility style). Every row stays on one line:
+    multi-line cells (hexdumps, disassembly) are printed indented below their row."""
 
     name = "quick"
 
     def render(self, grid, out):
-        out.write("\t".join(c for c, _ in grid.columns) + "\n\n")
+        names = [c for c, _ in grid.columns]
+        out.write("\t".join(names) + "\n\n")
         for depth, values in grid.rows:
             prefix = ("*" * depth + " ") if depth else ""
-            cells = [format_cell(v) for v in values]
+            cells, extra = [], []
+            for name, v in zip(names, values):
+                text = format_cell(v)
+                if "\n" in text:
+                    extra.append((name, text.strip("\n")))
+                    text = "<see below>"
+                cells.append(text.replace("\t", " "))
             out.write(prefix + "\t".join(cells) + "\n")
+            for name, text in extra:
+                out.write("    [%s]\n" % name)
+                for line in text.splitlines():
+                    out.write("    " + line + "\n")
 
 
 class PrettyRenderer(Renderer):
@@ -108,17 +120,26 @@ class CSVRenderer(Renderer):
             w.writerow([depth] + [format_cell(v, multiline=False) for v in values])
 
 
+def _json_row(names, depth, values) -> dict:
+    """One row as a JSON object. Values that could not be obtained are ``null``; their reasons (the text the
+    text renderers show as "N/A (reason)") are kept in ``__na`` so machine-readable output loses nothing."""
+    d = {"__depth": depth}
+    reasons = {}
+    for n, v in zip(names, values):
+        d[n] = to_plain(v)
+        if isinstance(v, NotAvailableValue) and v.reason not in ("", "N/A"):
+            reasons[n] = v.reason
+    if reasons:
+        d["__na"] = reasons
+    return d
+
+
 class JSONRenderer(Renderer):
     name = "json"
 
     def render(self, grid, out):
         names = [c for c, _ in grid.columns]
-        rows = []
-        for depth, values in grid.rows:
-            d = {"__depth": depth}
-            for n, v in zip(names, values):
-                d[n] = to_plain(v)
-            rows.append(d)
+        rows = [_json_row(names, depth, values) for depth, values in grid.rows]
         json.dump(rows, out, indent=2, default=str)
         out.write("\n")
 
@@ -129,9 +150,7 @@ class JSONLinesRenderer(Renderer):
     def render(self, grid, out):
         names = [c for c, _ in grid.columns]
         for depth, values in grid.rows:
-            d = {"__depth": depth}
-            d.update({n: to_plain(v) for n, v in zip(names, values)})
-            out.write(json.dumps(d, default=str) + "\n")
+            out.write(json.dumps(_json_row(names, depth, values), default=str) + "\n")
 
 
 class NoneRenderer(Renderer):

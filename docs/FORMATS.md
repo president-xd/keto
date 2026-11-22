@@ -4,28 +4,43 @@
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 8 | magic `VRMNCR\0\1` |
-| 8 | 4 | version (1) |
+| 0 | 8 | magic `KETOEVD\x01` (containers written before the rename carry `VRMNCR\0\1` and are still read) |
+| 8 | 4 | version (2; version 1 containers have no header digest) |
 | 12 | 4 | header size (64) |
 | 16 | 8 | segment table offset |
 | 24 | 4 | segment count |
 | 28 | 4 | flags |
 | 32 | 8 | metadata offset |
 | 40 | 8 | metadata length |
-| 48 | 16 | reserved |
+| 48 | 16 | header digest: the first 16 bytes of the evidence fingerprint (version 2; zero in version 1) |
 
 Segment table entry (32 bytes): `u32 space, u32 flags, u64 address, u64 length, u64 file_offset`.
-Spaces: 0 vram, 1 sysmem, 2 bar0, 3 bar1, 4 rom, 5 residual (keyed by CUDA VA), 6 gpuva.
+Spaces: 0 vram, 1 sysmem, 2 bar0, 3 bar1, 4 rom, 5 residual (keyed by CUDA VA), 6 gpuva, 7 process (keyed by
+process VA), 8 kbtf (the imaged kernel's BTF blob, kcore containers).
 
 The metadata JSON holds:
 
 - `tool`, `tool_version`, `created_utc`
-- `acquisition` (method, examiner, notes, statistics)
-- `device` (name, uuid, chipset/NVML arch/compute capability, VRAM size, VBIOS, driver)
-- `segments` (each with SHA-256), `data_sha256`
+- `acquisition` (method, examiner, notes, statistics, `status`: `complete` or `incomplete: <error>`)
+- `device` (name, uuid, chipset/NVML arch/compute capability, VRAM size, VBIOS, driver). An imported dump has no
+  `device` unless `--live-device` recorded the acquiring machine's GPU.
+- `segments` (each with space, address, length and SHA-256), `data_sha256` (SHA-256 over all segment data in order)
 - optional `live_snapshot` (recorded live-source answers)
+- `kernel` (kcore containers): banner, symbols, `phys_base`, `page_offset_base`, paging mode, `btf_sha256`,
+  `ram_ranges`, `zero_pages_omitted`, `own_pages_omitted` (RAM pages identical to already-written output pages),
+  and `acquired_ranges` when the acquisition was limited (`--phys-range`, `--max-bytes`) or interrupted
 
-`keto -f x.keto verify` re-hashes every segment.
+**Integrity.** The *evidence fingerprint* is `SHA-256("keto-fingerprint/1" || header bytes 8..48 || metadata JSON
+|| segment table)`. It covers the header fields, every recorded hash and the segment table, so with the segment
+hashes it pins the whole container. Its first 16 bytes are stored in the header and checked whenever a container
+is opened: a modified metadata block or segment table produces a warning before any analysis. The full fingerprint
+is printed by `keto acquire`; record it in the case notes. Because anyone who rewrites the data can also rewrite the
+hashes stored inside the file, only that external record exposes a complete forgery
+(`verify --expected-fingerprint <hex>`).
+
+`keto -f x.keto verify` re-hashes every segment, compares each segment-table entry with the metadata, recomputes
+`data_sha256`, checks the header digest and, with `--expected-fingerprint`, the recorded fingerprint. It works on
+every container, including live-snapshot containers (which hold no segments, only metadata).
 
 ## Profile JSON (`keto-profile/1`)
 

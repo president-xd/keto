@@ -72,6 +72,9 @@ def describe(code: int) -> dict:
 
 
 def _timestamp(line: str, boot_epoch: Optional[float], year: Optional[int]):
+    """The event time: an aware UTC datetime when the line says its zone (dmesg offset + boot time, ISO with an
+    offset or Z); a *naive* datetime (zone unknown: the logging host's local time, shown as logged) for ISO
+    times without an offset and for syslog times, rather than pretending they are UTC."""
     m = DMESG_TS_RE.match(line)
     if m:
         if boot_epoch is None:
@@ -79,24 +82,24 @@ def _timestamp(line: str, boot_epoch: Optional[float], year: Optional[int]):
         return _dt.datetime.fromtimestamp(boot_epoch + float(m.group(1)), tz=_dt.timezone.utc)
     m = ISO_TS_RE.match(line)
     if m:
-        tz = m.group(3) or "Z"
+        try:
+            dt = _dt.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        tz = m.group(3)
+        if not tz:
+            return dt
         if tz == "Z":
             offset = _dt.timezone.utc
         else:
             sign = 1 if tz[0] == "+" else -1
             hh, mm = int(tz[1:3]), int(tz[-2:])
             offset = _dt.timezone(sign * _dt.timedelta(hours=hh, minutes=mm))
-        try:
-            dt = _dt.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=offset)
-            return dt.astimezone(_dt.timezone.utc)
-        except ValueError:
-            return None
+        return dt.replace(tzinfo=offset).astimezone(_dt.timezone.utc)
     m = SYSLOG_TS_RE.match(line)
     if m and year:
         try:
-            dt = _dt.datetime(year, MONTHS[m.group(1)], int(m.group(2)),
-                              *[int(x) for x in m.group(3).split(":")], tzinfo=_dt.timezone.utc)
-            return dt
+            return _dt.datetime(year, MONTHS[m.group(1)], int(m.group(2)), *[int(x) for x in m.group(3).split(":")])
         except (KeyError, ValueError):
             return None
     return None

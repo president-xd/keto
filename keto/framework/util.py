@@ -101,6 +101,8 @@ def human_size(n: int) -> str:
 def parse_size(text: str) -> int:
     """Parse ``512M`` / ``2G`` / ``4096`` / ``0x1000`` into bytes."""
     t = str(text).strip().upper()
+    if t.startswith("0X"):  # hex has no unit suffix ("0x1B" is 27, not 1 byte)
+        return int(t, 16)
     mult = 1
     for suffix, m in (("KIB", 1 << 10), ("MIB", 1 << 20), ("GIB", 1 << 30), ("K", 1 << 10),
                       ("M", 1 << 20), ("G", 1 << 30), ("B", 1)):

@@ -53,6 +53,10 @@ class Btf:
             raise BtfError("not BTF (magic 0x%04x)" % magic)
         type_off, type_len, str_off, str_len = struct.unpack_from("<IIII", data, 8)
         base = hdr_len
+        for what, off, length in (("type", type_off, type_len), ("string", str_off, str_len)):
+            if base + off + length > len(data):
+                raise BtfError("BTF truncated: %s section ends at byte %d, blob has %d" % (what, base + off + length,
+                                                                                            len(data)))
         self.version = version
         self._strings = data[base + str_off:base + str_off + str_len]
         self.types: List[Optional[BtfType]] = [None]  # id 0 = void
@@ -64,6 +68,12 @@ class Btf:
         return self._strings[off:end if end >= 0 else None].decode("utf-8", "replace")
 
     def _parse(self, blob: bytes):
+        try:
+            self._parse_types(blob)
+        except struct.error:
+            raise BtfError("BTF type section truncated inside type %d" % len(self.types))
+
+    def _parse_types(self, blob: bytes):
         pos, n = 0, len(blob)
         while pos + 12 <= n:
             name_off, info, size_or_type = struct.unpack_from("<III", blob, pos)
@@ -118,12 +128,19 @@ class Btf:
             raise BtfError("struct %s not in BTF" % name)
         return t
 
+    def _type(self, tid: int) -> BtfType:
+        if not 0 < tid < len(self.types):
+            raise BtfError("BTF type id %d out of range (%d types)" % (tid, len(self.types) - 1))
+        return self.types[tid]
+
     def resolve(self, tid: int) -> Optional[BtfType]:
         """Strip typedefs and qualifiers."""
-        t = self.types[tid] if tid else None
-        while t is not None and t.kind in _QUALIFIERS:
-            t = self.types[t.ref] if t.ref else None
-        return t
+        t = self._type(tid) if tid else None
+        for _ in range(64):  # real chains are a few links long; a cycle means a corrupt BTF
+            if t is None or t.kind not in _QUALIFIERS:
+                return t
+            t = self._type(t.ref) if t.ref else None
+        raise BtfError("BTF type %d: typedef/qualifier chain does not end (corrupt BTF)" % tid)
 
     def sizeof(self, tid: int) -> int:
         t = self.resolve(tid)

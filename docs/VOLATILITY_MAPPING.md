@@ -6,6 +6,7 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 - **by role** (53): the OS structure has no literal GPU twin (Windows desktops, Linux page cache, macOS kauth...), so the mapping is to the plugin that fills the same investigative role, with the reason.
 - **unmapped** (0).
 - The 28 deprecated Volatility alias names forward to the plugins above.
+- A mapping says which Keto plugin answers the same question; it does not mean the Keto plugin runs on that Volatility plugin's OS. NVIDIA ships no driver for current macOS, so every `mac.*` row is a role analogy, and many `linux.*`/`windows.*` live analogues run only on that OS (docs/PLUGIN_REFERENCE.md says which).
 
 | Volatility 3 plugin | Keto counterpart(s) | Basis |
 |---|---|---|
@@ -26,7 +27,7 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `windows.psscan` | `nvidia.chanscan` | declared analogue |
 | `windows.pstree` | `nvidia.chantree`, `nvidia.pstree` | declared analogue |
 | `windows.cmdline` | `nvidia.cmdline` | declared analogue |
-| `windows.envars` | `nvidia.envars` | declared analogue |
+| `windows.envars` | `nvidia.envars`, `nvidia.envscan` | declared analogue |
 | `windows.sessions` | `nvidia.sessions` | declared analogue |
 | `windows.joblinks` | `nvidia.tsglist` | declared analogue |
 | `windows.threads` | `nvidia.gpfifo`, `nvidia.launches` | declared analogue |
@@ -76,7 +77,7 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `windows.registry.hivescan` | `nvidia.params`, `nvidia.autostart` | by role: as hivelist: every configuration source of the GPU stack |
 | `windows.registry.printkey` | `nvidia.malware.watchdog`, `nvidia.params` | declared analogue |
 | `windows.registry.userassist` | `nvidia.accounting` | declared analogue |
-| `windows.registry.amcache` | `nvidia.accounting`, `nvidia.computecache`, `nvidia.jitcache` | declared analogue |
+| `windows.registry.amcache` | `nvidia.accounting`, `nvidia.computecache`, `nvidia.jitcache`, `nvidia.shadercache` | declared analogue |
 | `windows.registry.scheduled_tasks` | `nvidia.autostart` | declared analogue |
 | `windows.registry.hashdump` | `nvidia.secrets` | declared analogue |
 | `windows.registry.lsadump` | `nvidia.secrets`, `nvidia.aeskeys` | by role: secrets and key material present in GPU memory |
@@ -84,7 +85,7 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `windows.registry.getcellroutine` | `nvidia.malware.ptcheck` | declared analogue |
 | `windows.cmdscan` | `nvidia.pbscan`, `nvidia.pushbuf` | declared analogue |
 | `windows.consoles` | `nvidia.pushbuf` | declared analogue |
-| `windows.shimcachemem` | `nvidia.computecache`, `nvidia.jitcache` | declared analogue |
+| `windows.shimcachemem` | `nvidia.computecache`, `nvidia.jitcache`, `nvidia.shadercache` | declared analogue |
 | `windows.truecrypt` | `nvidia.aeskeys` | declared analogue |
 | `windows.windowstations` | `nvidia.surfaces`, `nvidia.sessions` | by role: what was on screen: render targets and capture sessions |
 | `windows.desktops` | `nvidia.surfaces` | by role: recovered framebuffers / render targets |
@@ -109,14 +110,14 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `linux.pidhashtable` | `nvidia.runlist` | declared analogue |
 | `linux.pstree` | `nvidia.chantree`, `nvidia.pstree` | declared analogue |
 | `linux.psaux` | `nvidia.cmdline` | declared analogue |
-| `linux.envars` | `nvidia.envars` | declared analogue |
+| `linux.envars` | `nvidia.envars`, `nvidia.envscan` | declared analogue |
 | `linux.capabilities` | `nvidia.containers`, `nvidia.privileges` | declared analogue |
 | `linux.ptrace` | `nvidia.debugger` | declared analogue |
 | `linux.pscallstack` | `nvidia.launches` | declared analogue |
 | `linux.kthreads` | `nvidia.privileges`, `nvidia.chantree` | by role: kernel-owned (privileged) GPU channels |
 | `linux.boottime` | `nvidia.gputimeline` | declared analogue |
 | `linux.bash` | `nvidia.pushbuf` | declared analogue |
-| `linux.proc.Maps` | `nvidia.malware.rawaccess`, `nvidia.mappings`, `nvidia.memmap`, `wsl.dxgallocs` | declared analogue |
+| `linux.proc.Maps` | `nvidia.malware.rawaccess`, `nvidia.mappings`, `nvidia.memmap`, `wsl.dxgallocs`, `wsl.dxgpageowners` | declared analogue |
 | `linux.elfs` | `nvidia.cubindump` | declared analogue |
 | `linux.library_list` | `nvidia.kernels`, `nvidia.libs` | declared analogue |
 | `linux.vmaregexscan` | `nvidia.varegexscan` | declared analogue |

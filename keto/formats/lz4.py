@@ -14,9 +14,13 @@ class LZ4Error(ValueError):
 
 
 def decompress(src: bytes, max_size: int = 1 << 30, expected_size: int = 0) -> bytes:
+    """Decompress an LZ4 block. With ``expected_size`` the output is exactly that long (decoding stops there, so
+    memory never exceeds it); without it, output beyond ``max_size`` raises :class:`LZ4Error`."""
     src = bytes(src)
     out = bytearray()
     i, n = 0, len(src)
+    if expected_size:
+        max_size = min(max_size, expected_size)
     while i < n:
         token = src[i]
         i += 1
@@ -32,6 +36,10 @@ def decompress(src: bytes, max_size: int = 1 << 30, expected_size: int = 0) -> b
                     break
         if i + lit > n:
             raise LZ4Error("literal run past end of input")
+        if len(out) + lit > max_size:
+            if not expected_size:
+                raise LZ4Error("output exceeds limit (%d bytes)" % max_size)
+            lit = max_size - len(out)
         out += src[i:i + lit]
         i += lit
         if expected_size and len(out) >= expected_size:
@@ -55,16 +63,17 @@ def decompress(src: bytes, max_size: int = 1 << 30, expected_size: int = 0) -> b
                 if b != 255:
                     break
         mlen += 4
+        if len(out) + mlen > max_size:
+            if not expected_size:
+                raise LZ4Error("output exceeds limit (%d bytes)" % max_size)
+            mlen = max_size - len(out)
         start = len(out) - offset
         if offset >= mlen:
             out += out[start:start + mlen]
-        else:  # overlapping copy (run-length style)
-            for k in range(mlen):
-                out.append(out[start + k])
-        if len(out) > max_size:
-            raise LZ4Error("output exceeds limit")
-    if expected_size and len(out) > expected_size:
-        del out[expected_size:]
+        else:  # overlapping copy: byte-wise copying repeats the last `offset` bytes, i.e. a periodic pattern
+            out += (out[start:] * (mlen // offset + 1))[:mlen]
+        if expected_size and len(out) >= expected_size:
+            break
     return bytes(out)
 
 

@@ -32,6 +32,8 @@ FLAG_DEFLATE, FLAG_ZSTD = 0x1000, 0x8000
 CODECS = ((FLAG_COMPRESS, "lz4"), (FLAG_ZSTD, "zstd"), (FLAG_DEFLATE, "deflate"))
 ENTRY_FMT = "<HHIQIIHHIIIQQQ"
 ENTRY_SIZE = struct.calcsize(ENTRY_FMT)  # 64
+#: no fatbin entry decompresses to more than this (hostile entries are cut off here, not allocated)
+MAX_ENTRY_SIZE = 512 << 20
 
 
 class FatbinEntry:
@@ -58,33 +60,49 @@ class FatbinEntry:
         return self.compression is not None
 
     @property
+    def size_limit(self) -> int:
+        """Largest decompressed size accepted: the declared size when the header has one, else MAX_ENTRY_SIZE."""
+        return min(self.decompressed_size, MAX_ENTRY_SIZE) if self.decompressed_size else MAX_ENTRY_SIZE
+
+    @property
     def data(self) -> Optional[bytes]:
-        """Decompressed payload (None if decompression failed or no decoder is available)."""
+        """Decompressed payload (None if decompression failed or no decoder is available; ``error`` says why).
+        Output is bounded by :attr:`size_limit`, so a hostile entry cannot exhaust memory."""
         if self._data is None and self.error is None:
             codec = self.compression
-            if codec is None:
+            limit = self.size_limit
+            if self.decompressed_size > MAX_ENTRY_SIZE:
+                self.error = "declared decompressed size %d exceeds the %d-byte limit" % (self.decompressed_size,
+                                                                                          MAX_ENTRY_SIZE)
+            elif codec is None:
                 self._data = self.payload
             elif codec == "lz4":
                 try:
-                    self._data = lz4.decompress(self.payload, expected_size=self.decompressed_size or 0)
+                    self._data = lz4.decompress(self.payload, max_size=limit,
+                                                expected_size=self.decompressed_size or 0)
                 except lz4.LZ4Error as exc:
                     self.error = "decompression failed: %s" % exc
             elif codec == "zstd":
                 if not compression.zstd_available():
                     self.error = "zstd entry: no zstd decoder (Python 3.14+ or the 'zstandard' package)"
                 else:
-                    got = compression.zstd_frame(self.payload)
+                    got = compression.zstd_frame(self.payload, max_output=limit)
                     if got is None:
-                        self.error = "decompression failed: not a complete zstd frame"
+                        self.error = "decompression failed: not a complete zstd frame of at most %d bytes" % limit
                     else:
                         self._data = got[0]
             else:
                 for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS, 31):  # zlib-wrapped, raw deflate, gzip
                     try:
-                        self._data = zlib.decompressobj(wbits).decompress(self.payload)
-                        break
+                        d = zlib.decompressobj(wbits)
+                        out = d.decompress(self.payload, limit + 1)
                     except zlib.error:
                         continue
+                    if len(out) > limit:
+                        self.error = "decompression failed: output exceeds %d bytes" % limit
+                    else:
+                        self._data = out
+                    break
                 else:
                     self.error = "decompression failed: not a deflate stream"
         return self._data

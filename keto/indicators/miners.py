@@ -26,6 +26,20 @@ CRACKER_PATTERNS = [(re.compile(r"\bm\d{5}_(?:m|s)(?:04|08|16)\b"), "hashcat ker
                     (re.compile(r"\bhashcat\b", re.I), "hashcat string"),
                     (re.compile(r"\bjohn the ripper\b", re.I), "John the Ripper string")]
 GPU_MALWARE_POC = ["jellyfish", "win_jelly", "demon keylogger"]
+#: hash primitives used by miners AND by ordinary software (password hashing, file hashing, sandboxes, CI tools):
+#: on their own they are not mining evidence outside GPU kernel names, and even there only a weak hint
+GENERIC_ALGORITHMS = {"argon2", "scrypt", "blake2b", "blake3", "sha256d", "kangaroo12", "cuckoo", "octopus",
+                      "lyra2", "equihash", "sha3x"}
+#: miner names that are also ordinary words or libraries (miniz is a zlib library, excavator a word...): they count
+#: only as the executable itself (a command-line token / path basename), not anywhere in a string
+AMBIGUOUS_SOFTWARE = {"miniz", "rigel", "excavator", "trex", "hiveos", "nicehash", "minerstat"}
+#: coin names among ALGORITHMS: mining evidence in GPU kernel names, not in wallets, web pages or command lines
+COIN_NAMES = {"alephium", "ironfish", "abelian"}
+#: algorithm ids in xmrig/SRBMiner syntax ("--algo rx/0")
+ALGO_IDS = ["rx/0", "rx/wow", "rx/arq", "rx/graft", "rx/sfx", "rx/keva", "rx/yada", "cn/r", "cn/0", "cn/1", "cn/2",
+            "cn/half", "cn/fast", "cn/rto", "cn/rwz", "cn/zls", "cn/double", "cn/ccx", "cn-lite/1", "cn-heavy/0",
+            "cn-heavy/xhv", "cn-pico", "argon2/chukwa", "argon2/chukwav2", "argon2/ninja", "ghostrider", "astrobwt"]
+CONTEXTS = ("any", "kernel", "process", "string")
 
 def strong_anchors() -> List[bytes]:
     """Few, distinctive literals: cheap enough to sweep a multi-GB image."""
@@ -47,13 +61,54 @@ BYTES_RE = re.compile(("(?i)(%s)" % "|".join(map(re.escape, ALGORITHMS + MINER_S
                                                 GPU_MALWARE_POC))).encode())
 
 
-def classify(text: str) -> List[Tuple[str, str]]:
-    """Return ``[(category, indicator)]`` for a kernel name, command line or string."""
+_ALGO_ARG_RE = re.compile(r"(?i)(?:--algo(?:rithm)?|--coin|(?<!\w)-a)(?:\s+|=)['\"]?([\w./-]+)")
+_ALGO_ID_RE = re.compile(r"(?i)(?<![\w/])(%s)(?![\w/])" % "|".join(map(re.escape, sorted(ALGO_IDS, key=len,
+                                                                                         reverse=True))))
+# the executable itself: the first command token, or the basename of a path
+_EXE_TOKEN_RE = re.compile(r"(?i)(?:^[\"']?|[\\/])(%s)(?:\.exe)?(?=$|[\s\"'])" % "|".join(map(re.escape,
+                                                                                            AMBIGUOUS_SOFTWARE)))
+
+
+def classify(text: str, context: str = "any") -> List[Tuple[str, str]]:
+    """Return ``[(category, indicator)]`` for a kernel name, command line or string.
+
+    ``context`` says what ``text`` is, so ordinary words are not taken for mining evidence:
+
+    * ``"kernel"``: a GPU kernel / PTX entry name. Distinctive mining algorithms are ``miner-algorithm``; generic
+      hash primitives (argon2, blake3, scrypt...) are only ``hash-primitive`` (a weak hint).
+    * ``"process"``: a process name, path, command line, environment or mapped file. Generic primitives count
+      only as an explicit ``--algo``/``-a`` argument; ambiguous names (miniz, rigel...) only as the executable.
+    * ``"string"``: text carved from memory: pool markers, distinctive miner names and algorithms only.
+    * ``"any"`` (default): every indicator, as names and substrings."""
+    if context not in CONTEXTS:
+        raise ValueError("unknown context %r" % context)
     out = []
     for m in _ALG_RE.finditer(text):
-        out.append(("miner-algorithm", m.group(1).lower()))
+        alg = m.group(1).lower()
+        if alg in GENERIC_ALGORITHMS and context != "any":
+            if context == "kernel":
+                out.append(("hash-primitive", alg))
+            continue
+        if alg in COIN_NAMES and context in ("process", "string"):
+            continue
+        out.append(("miner-algorithm", alg))
+    if context in ("any", "process", "string"):
+        for m in _ALGO_ID_RE.finditer(text):
+            out.append(("miner-algorithm", m.group(1).lower()))
+    if context == "process":  # an explicit algorithm argument is mining evidence even for generic/coin names
+        known = set(ALGORITHMS)
+        for m in _ALGO_ARG_RE.finditer(text):
+            alg = m.group(1).lower()
+            if alg.split("/")[0] in known:
+                out.append(("miner-algorithm", alg))
     for m in _SOFT_RE.finditer(text):
-        out.append(("miner-software", m.group(1).lower()))
+        name = m.group(1).lower()
+        if name in AMBIGUOUS_SOFTWARE and context != "any":
+            continue
+        out.append(("miner-software", name))
+    if context == "process":
+        for m in _EXE_TOKEN_RE.finditer(text):
+            out.append(("miner-software", m.group(1).lower()))
     for m in _POOL_RE.finditer(text):
         out.append(("mining-pool", m.group(1).lower()))
     for rx, label in CRACKER_PATTERNS:

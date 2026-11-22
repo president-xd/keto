@@ -92,7 +92,7 @@ def main():
                 "Chipset ids (NV_PMC_BOOT_0[28:20]), NVML architecture ids and CUDA compute capabilities: "
                 "docs/research/NVIDIA_HW_FACTS.md section 5 (ids marked 'derived' are not listed by any source).",
                 "Engine classes per chip: docs/research/NVIDIA_COMMAND_FACTS.md section 0 (nouveau/GSP-RM/nvgpu tables).",
-                "QMD version is read from each descriptor (all published layouts V00_06..V05_00 are decoded)."]
+                "QMD version is read from each descriptor (all published layouts V00_06..V05_01 are decoded, V05_01 per sub-task)."]
         if name == "pascal":
             prov.append("Pascal instance blocks select VER1 or VER2 page tables individually (RAMIN bit 10); both are walked.")
         if name in ("kepler", "maxwell"):

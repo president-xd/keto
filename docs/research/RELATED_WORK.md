@@ -939,23 +939,24 @@ Ranking weighs (1) evidence that the technique is used in the wild or is the doc
 | G18 | **ECC policy flag for Rowhammer exposure** | [M10] [secondary] | In `nvidia.ecc`, flag ECC disabled on GDDR6 data-centre or workstation boards and bursts of corrected errors or row remaps. |
 
 
-### Status of the gaps (2026-11-17)
+### Status of the gaps (2026-11-18)
 
 | Gap | Status | Where |
 |---|---|---|
 | G1 | Done for live triage and snapshots | `windows.gpuprocs` (Toolhelp32 modules, PDH GPU Engine / GPU Process Memory, visible windows) |
 | G2 | Done | OpenCL C, SPIR-V and DXBC/DXIL in `nvidia.artifactscan`; XOR-with-modulo decryptor shape in OpenCL, SPIR-V and PTX; YARA `KETO_OpenCL_*`, `KETO_SPIRV_Module`, `KETO_DXBC_Shader` |
 | G3 / G15 | Done for WSL2 | `wsl.dxgprocs` (dxgprocess with PID/namespace PID, cross-view with tasks and /dev/dxg handles); native-Linux NVOC/RM walk not implemented (no native Linux NVIDIA host to validate on) |
-| G4 | Open | |
+| G4 | Done | `nvidia.malware.hostpages` (GPU sysmem PTEs vs page ownership from every task's page tables in a host RAM image), `wsl.dxgpageowners` (guest pages of WSL2 GPU allocations); validated live against `/proc/self/pagemap` |
 | G5 | Done | `nvidia.malware.unaccounted` (NVML used memory and utilisation vs per-process lists; WDDM limitation reported) |
 | G6 | Profiles done; corpus not ingested | Kepler/Maxwell profiles, VER1 page tables, gk104/gm107 runlists, per-generation tests; the DFRWS 2015 image was not downloaded |
 | G7 | Done | `nvidia.malware.watchdog` (TDR registry, i915 hang check, NVIDIA RegistryDwords); Sigma `tdr_disabled` |
 | G8 | Done (live Linux) | `nvidia.malware.rawaccess` |
 | G9 | Done | ATT&CK in `keto report`; `keto sigma` writes 9 rules |
-| G10 | Partly | alpha 0x00 (XRGB) surfaces accepted; row width still found by the smoothness search, not autocorrelation |
+| G10 | Done | alpha 0x00 (XRGB) surfaces accepted; row width by autocorrelation of the colour bytes (any width 16..8192 px), smoothness search as fallback |
 | G11 | Done | exclusive compute mode in `nvidia.malware.cryptojack` |
 | G12 | Done | QMD V00_06 .. V05_00 decoded (V05_01 raw) |
-| G13, G16, G17 | Open | |
+| G13 | Done | `nvidia.malware.scraper` (live: a process holding most of a GPU's memory; Windows counters or NVML), `nvidia.malware.fillscan` (image: uniform marker fills); validated with a real 4.3 GiB 0xFF-filling CUDA process |
+| G16, G17 | Open | |
 | G14 | Done | shellcode idioms, file systems and archives in `nvidia.malware.hostcode` |
 | G18 | Done | ECC-off / pending-off / corrected bursts / remap failures in `nvidia.ecc` |
 

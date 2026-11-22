@@ -44,14 +44,23 @@ class Banners(Plugin):
     def run(self):
         layers = [self.ctx.primary] + ([self.ctx.layers["sysmem"]] if "sysmem" in self.ctx.layers else [])
         seen = {}
+        spans = []  # (layer, start, end, key): a banner inside a longer banner of the same kind is not repeated
         for layer in layers:
             for kind, anchor, pattern in BANNER_PATTERNS:
                 for off, m in scan(layer, AnchoredScanner([anchor], re.compile(pattern), after=256)):
                     text = m.group().decode("ascii", "replace").strip()
-                    key = (kind, text)
-                    if key not in seen:
-                        seen[key] = [layer.name, off, 0]
-                    seen[key][2] += 1
+                    spans.append((layer.name, off, off + len(m.group()), kind, text))
+        spans.sort(key=lambda s: (s[0], s[1], -(s[2] - s[1])))
+        covered = {}
+        for lname, start, end, kind, text in spans:
+            prev = covered.get((lname, kind))
+            if prev is not None and prev[0] <= start and end <= prev[1]:
+                continue  # e.g. "NVIDIA UNIX ... Kernel Module 590.74" inside the "NVRM version:" banner
+            covered[(lname, kind)] = (start, end)
+            key = (kind, text)
+            if key not in seen:
+                seen[key] = [lname, start, 0]
+            seen[key][2] += 1
         rows = [(0, (layer, Address(off), kind, count, text)) for (kind, text), (layer, off, count) in
                 sorted(seen.items(), key=lambda kv: (kv[1][0], kv[1][1]))][: self.opts["limit"]]
         return TreeGrid([("Layer", str), ("Offset", Address), ("Kind", str), ("Count", int), ("Banner", str)], rows)
@@ -140,13 +149,30 @@ class ConfigWriter(Plugin):
         return TreeGrid([("Key", str), ("Value", str)], rows)
 
 
+def make_sparse(fh) -> None:
+    """Mark an open file sparse on NTFS so the gaps layerwriter seeks over take no disk space (POSIX file systems
+    leave holes on their own). Best effort: a file system without sparse support just stores the zeros."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        returned = wintypes.DWORD()
+        ctypes.windll.kernel32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(fh.fileno())), 0x000900C4,
+                                               None, 0, None, 0, ctypes.byref(returned), None)  # FSCTL_SET_SPARSE
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
 class LayerWriter(Plugin):
     NAME = "layerwriter"
     CATEGORY = "framework"
-    DESCRIPTION = ("Exports a layer to a flat file: the primary/physical layer (gaps zero-filled) or any GPU "
-                   "address space (readable runs back to back, plus a .map file).")
+    DESCRIPTION = ("Exports a layer to a flat file: the primary/physical layer (gaps read back as zeros; the file "
+                   "is sparse, so gaps take no disk space) or any GPU address space (readable runs back to back, "
+                   "plus a .map file).")
     METHOD = ("Reads the selected layer's readable runs in 4 MiB blocks; physical layers are written at their "
-              "own offsets, virtual layers sequentially with an offset map.")
+              "own offsets into a sparse file, virtual layers sequentially with an offset map.")
     ANALOG = "layerwriter"
     REQUIREMENTS = [Requirement("layer", str, None, "layer name (default: primary); see frameworkinfo"),
                     Requirement("list", bool, False, "only list layers")]
@@ -169,6 +195,8 @@ class LayerWriter(Plugin):
         written = 0
         maplines = []
         with open(path, "wb") as fh:
+            if not virtual:
+                make_sparse(fh)
             for start, length in layer.ranges():
                 if not virtual:
                     fh.seek(start)
@@ -187,10 +215,35 @@ class LayerWriter(Plugin):
                         [(0, (name, path, written, len(layer.ranges())))])
 
 
+def resolve_layer(ctx, name):
+    """The layer called ``name`` (default: the primary layer). GPU address spaces (``as_<pdb>``) are discovered
+    on demand; an unknown name raises RequirementError listing the available layers."""
+    name = name or ctx.primary_name
+    if name and name.startswith("as_") and name not in ctx.layers:
+        from keto.gpu import discovery
+        try:
+            discovery.address_spaces(ctx)
+        except UnsupportedError:
+            pass
+    layer = ctx.layers.get(name) if name else None
+    if layer is None:
+        raise RequirementError("unknown layer %r (available: %s; GPU address spaces are as_<pdb>, see "
+                               "nvidia.addrspaces)" % (name, ", ".join(sorted(ctx.layers)) or "none"))
+    return layer
+
+
+def compile_regex(pattern: str):
+    try:
+        return re.compile(pattern.encode("utf-8", "surrogateescape"), re.DOTALL)
+    except re.error as exc:
+        raise RequirementError("invalid --pattern %r: %s" % (pattern, exc))
+
+
 class RegexScan(Plugin):
     NAME = "regexscan"
     CATEGORY = "framework"
-    DESCRIPTION = "Searches a layer (default: the primary physical layer) for a regular expression."
+    DESCRIPTION = ("Searches a layer (default: the primary physical layer; any GPU address space as as_<pdb>) for a "
+                   "regular expression.")
     METHOD = "Runs a bytes regex chunk by chunk with overlap so matches across chunk boundaries are kept."
     ANALOG = "regexscan"
     REQUIREMENTS = [Requirement("pattern", str, None, "regular expression"),
@@ -199,10 +252,10 @@ class RegexScan(Plugin):
     def run(self):
         if not self.opts["pattern"]:
             raise RequirementError("--pattern is required")
-        layer = self.ctx.layers.get(self.opts["layer"] or self.ctx.primary_name)
-        if layer is None:
-            raise RequirementError("unknown layer")
-        rx = re.compile(self.opts["pattern"].encode(), re.DOTALL)
+        if self.opts["max_length"] < 1:
+            raise RequirementError("--max-length must be at least 1")
+        layer = resolve_layer(self.ctx, self.opts["layer"])
+        rx = compile_regex(self.opts["pattern"])
         rows = ((0, (layer.name, Address(off), Bytes(m.group()[:self.opts["max_length"]])))
                 for off, m in scan(layer, RegexScanner(rx, max_length=self.opts["max_length"])))
         return TreeGrid([("Layer", str), ("Offset", Address), ("Match", Bytes)], rows)
@@ -219,13 +272,16 @@ def compile_yara(rule_text, rule_file, builtin=False):
                                "regexscan / nvidia.varegexscan")
     if builtin and not (rule_file or rule_text):
         rule_file = BUILTIN_RULES
-    if rule_file:
-        return yara.compile(filepath=rule_file)
-    if not rule_text:
+    if not rule_file and not rule_text:
         raise RequirementError("--yara-rules, --yara-file or --builtin is required")
-    if "rule " not in rule_text:
+    if rule_file and not os.path.isfile(rule_file):
+        raise RequirementError("YARA rules file not found: %s" % rule_file)
+    if not rule_file and "rule " not in rule_text:
         rule_text = 'rule r1 { strings: $a = "%s" condition: $a }' % rule_text.replace('"', '\\"')
-    return yara.compile(source=rule_text)
+    try:
+        return yara.compile(filepath=rule_file) if rule_file else yara.compile(source=rule_text)
+    except yara.Error as exc:  # SyntaxError and friends derive from yara.Error
+        raise RequirementError("YARA rules do not compile: %s" % exc)
 
 
 def yara_hits(rules, layer, chunk=16 << 20, overlap=4096):
@@ -254,51 +310,77 @@ class YaraScan(Plugin):
 
     def run(self):
         rules = compile_yara(self.opts["yara_rules"], self.opts["yara_file"], self.opts["builtin"])
-        layer = self.ctx.layers.get(self.opts["layer"] or self.ctx.primary_name)
+        layer = resolve_layer(self.ctx, self.opts["layer"])
         rows = ((0, (layer.name, Address(o), r, i, Bytes(d[:64]))) for o, r, i, d in yara_hits(rules, layer))
         return TreeGrid([("Layer", str), ("Offset", Address), ("Rule", str), ("String", str), ("Data", Bytes)], rows)
+
+
+MAX_HEXDUMP = 16 << 20
 
 
 class HexDump(Plugin):
     NAME = "hexdump"
     CATEGORY = "framework"
     DESCRIPTION = "Hex-dumps bytes from any layer (physical VRAM, host memory, or a GPU virtual address space)."
-    METHOD = "Reads through the chosen layer (translating GPU VAs via the page tables) and formats 16 bytes per line."
+    METHOD = ("Reads through the chosen layer (translating GPU VAs via the page tables) and formats 16 bytes per "
+              "line; bytes that are not backed by the layer (unmapped VAs, gaps, beyond the image) are reported in "
+              "the Unbacked column and shown as zeros.")
     ANALOG = "volshell db/dq"
-    REQUIREMENTS = [Requirement("address", "address", None, "start address"), Requirement("length", "size", 256, "bytes"),
+    REQUIREMENTS = [Requirement("address", "address", None, "start address"),
+                    Requirement("length", "size", 256, "bytes (at most 16M; use layerwriter or memmap --dump "
+                                                       "for more)"),
                     Requirement("layer", str, None, "layer name (as_<pdb> for a GPU address space)")]
 
     def run(self):
-        from keto.gpu import discovery
         if self.opts["address"] is None:
             raise RequirementError("--address is required")
-        name = self.opts["layer"] or self.ctx.primary_name
-        if name and name.startswith("as_"):
-            discovery.address_spaces(self.ctx)
-        layer = self.ctx.layers.get(name)
-        if layer is None:
-            raise RequirementError("unknown layer %r" % name)
-        data = layer.read(self.opts["address"], self.opts["length"], pad=True)
-        return TreeGrid([("Layer", str), ("Address", Address), ("Dump", Disassembly)],
-                        [(0, (name, Address(self.opts["address"]), Disassembly(hexdump(data, self.opts["address"]))))])
+        length = self.opts["length"]
+        if not 0 < length <= MAX_HEXDUMP:
+            raise RequirementError("--length must be between 1 and %d bytes" % MAX_HEXDUMP)
+        layer = resolve_layer(self.ctx, self.opts["layer"])
+        addr = self.opts["address"]
+        data = layer.read(addr, length, pad=True)
+        backed = 0
+        for start, rlen in layer.ranges():
+            lo, hi = max(addr, start), min(addr + length, start + rlen)
+            if hi > lo:
+                backed += hi - lo
+        unbacked = length - backed
+        note = ("all %d byte(s) backed" % length if not unbacked else
+                "%d of %d byte(s) NOT backed by %s (shown as zeros)" % (unbacked, length, layer.name))
+        return TreeGrid([("Layer", str), ("Address", Address), ("Unbacked", str), ("Dump", Disassembly)],
+                        [(0, (layer.name, Address(addr), note, Disassembly(hexdump(data, addr))))])
 
 
 class Verify(Plugin):
     NAME = "verify"
     CATEGORY = "framework"
-    DESCRIPTION = "Verifies the integrity of a .keto evidence container (SHA-256 of every segment against its metadata)."
-    METHOD = "Re-reads each segment from the container file and compares its SHA-256 with the hash recorded at acquisition."
+    DESCRIPTION = ("Verifies the integrity of a .keto evidence container (VRAM, host RAM, process, CUDA residual or "
+                   "live-snapshot containers): every segment's SHA-256, the segment table, the metadata and the "
+                   "evidence fingerprint recorded at acquisition.")
+    METHOD = ("Re-reads each segment and compares its SHA-256 and table entry with the metadata; recomputes the "
+              "SHA-256 over all data against data_sha256; checks the header digest that covers the header fields, "
+              "metadata and segment table (version 2 containers); --expected-fingerprint compares the evidence "
+              "fingerprint with the value recorded outside the container at acquisition.")
     ANALOG = "(chain of custody; no direct Volatility analogue)"
+    SOURCES = ("file",)
+    REQUIREMENTS = [Requirement("expected_fingerprint", str, None,
+                                "evidence fingerprint printed at acquisition (hex) to compare with")]
 
     def run(self):
         if self.ctx.container is None:
-            raise UnsupportedError("verify needs a .keto container image")
-        rows = [(0, (r["segment"], r["space"], Address(r["address"]), r["length"], r["sha256"], r["ok"]))
-                for r in self.ctx.container.verify()]
-        meta = self.ctx.metadata
-        rows.append((0, (-1, "metadata", Address(0), 0, meta.get("data_sha256", "-"), True)))
+            raise RequirementError("verify needs a .keto container: use -f <evidence.keto>")
+        cont = self.ctx.container
+        rows = [(0, (r["segment"], r["space"], Address(r["address"]), r["length"], r["sha256"], r["ok"],
+                     r.get("detail", ""))) for r in cont.verify()]
+        want = (self.opts["expected_fingerprint"] or "").strip().lower()
+        if want:
+            ok = len(want) >= 32 and cont.fingerprint.startswith(want)
+            rows.append((0, (-4, "fingerprint", Address(0), 0, cont.fingerprint, ok,
+                             "matches the recorded fingerprint" if ok else
+                             "DOES NOT MATCH the recorded fingerprint %s" % want)))
         return TreeGrid([("Segment", int), ("Space", str), ("Address", Address), ("Length", int), ("SHA256", str),
-                         ("OK", bool)], rows)
+                         ("OK", bool), ("Detail", str)], rows)
 
 
 class Timeliner(Plugin):
@@ -307,7 +389,9 @@ class Timeliner(Plugin):
     DESCRIPTION = ("Builds one time-sorted timeline from every plugin that produces timestamps (GPU processes, "
                    "accounting history, Xid errors, compute-cache files, acquisition metadata).")
     METHOD = ("Runs every plugin implementing TimeLinerInterface whose data source is available, collects "
-              "(description, type, time) events and sorts them; --create-bodyfile writes a mactime body file.")
+              "(description, type, time) events and sorts them; --create-bodyfile writes a mactime body file. "
+              "Sources that read the analyst machine's own files by default (JIT and shader caches) are only "
+              "included when the evidence is this live system (--live).")
     ANALOG = "timeliner"
     SOURCES = ("image", "live")
     REQUIREMENTS = [Requirement("create_bodyfile", bool, False, "also write timeline.body (mactime format)"),
@@ -320,11 +404,16 @@ class Timeliner(Plugin):
             events.append(("keto", "evidence acquired (%s)" % meta.get("acquisition", {}).get("method", "?"),
                            "Acquired", meta["created_utc"]))
         errors = []
+        local = self.ctx.analyses_local_system()
         for name in sorted(PLUGINS):
             cls = PLUGINS[name]
             if cls is Timeliner or not issubclass(cls, TimeLinerInterface):
                 continue
             if self.opts["plugin_filter"] and self.opts["plugin_filter"] not in name:
+                continue
+            if getattr(cls, "LOCAL_DEFAULTS", False) and not local:
+                errors.append((name, "reads this analyst machine's files by default, which are not part of the "
+                                     "evidence: run %s --path <collected directory> separately" % name))
                 continue
             try:
                 inst = cls(self.ctx, {})

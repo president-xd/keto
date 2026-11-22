@@ -164,7 +164,8 @@ def parse_dxbc(data: bytes) -> Optional[DxbcContainer]:
     if len(data) < 32 or data[:4] != DXBC_MAGIC:
         return None
     version, total, count = struct.unpack_from("<III", data, 20)
-    if version != 1 or not 32 <= total <= (64 << 20) or not 0 < count <= 64 or 32 + 4 * count > total:
+    if version != 1 or not 32 <= total <= (64 << 20) or not 0 < count <= 64 or 32 + 4 * count > total \
+            or 32 + 4 * count > len(data):  # the part table must be present, not only claimed
         return None
     parts = []
     for i in range(count):

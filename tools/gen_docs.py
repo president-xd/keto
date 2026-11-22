@@ -2,7 +2,10 @@
 """Generate docs/PLUGIN_REFERENCE.md and docs/VOLATILITY_MAPPING.md from the
 plugins' own metadata, so documentation cannot drift from the code.
 
-    python tools/gen_docs.py [--volatility-reference <Volatility3_Plugin_Reference.md>]
+    python tools/gen_docs.py [--volatility-reference <plugin list .md>]
+
+The Volatility 3 plugin list (names and deprecated aliases) is kept in tools/volatility3_plugins.md, so both
+documents can be regenerated from the repository alone.
 """
 
 import argparse
@@ -189,14 +192,19 @@ def mapping(vol_ref):
             "- **by role** (%d): the OS structure has no literal GPU twin (Windows desktops, Linux page cache, macOS "
             "kauth...), so the mapping is to the plugin that fills the same investigative role, with the reason." % role,
             "- **unmapped** (%d)." % len(missing),
-            "- The %d deprecated Volatility alias names forward to the plugins above." % len(deprecated), "",
+            "- The %d deprecated Volatility alias names forward to the plugins above." % len(deprecated),
+            "- A mapping says which Keto plugin answers the same question; it does not mean the Keto plugin runs on "
+            "that Volatility plugin's OS. NVIDIA ships no driver for current macOS, so every `mac.*` row is a role "
+            "analogy, and many `linux.*`/`windows.*` live analogues run only on that OS "
+            "(docs/PLUGIN_REFERENCE.md says which).", "",
             "| Volatility 3 plugin | Keto counterpart(s) | Basis |", "|---|---|---|"]
     return "\n".join(head + rows + [""])
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--volatility-reference", default=r"D:\volitility research\Volatility3_Plugin_Reference.md")
+    ap.add_argument("--volatility-reference", default=os.path.join(ROOT, "tools", "volatility3_plugins.md"),
+                    help="Volatility 3 plugin list (names and deprecated aliases); default: the copy in tools/")
     args = ap.parse_args()
     load_plugins()
     os.makedirs(os.path.join(ROOT, "docs"), exist_ok=True)

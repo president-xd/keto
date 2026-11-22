@@ -78,8 +78,11 @@ class RealDriverDataTests(unittest.TestCase):
         self.assertEqual(qmd.signature("v05_00"), (56, 0xFF0000, 0x50 << 16))
 
     def test_real_nvidia_fatbins_if_driver_installed(self):
+        win = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "DriverStore", "FileRepository")
         libs = [p for p in glob.glob("/usr/lib/wsl/lib/libnvdxdlkernels.so") + glob.glob("/usr/lib/x86_64-linux-gnu/libcublas*.so*")
-                + glob.glob("/usr/local/cuda/lib64/libcublas*.so*") if os.path.isfile(p)]
+                + glob.glob("/usr/local/cuda/lib64/libcublas*.so*")
+                + glob.glob(os.path.join(win, "nv*", "nvdirectsr.dll")) + glob.glob(os.path.join(win, "nv*", "nvoptix.dll"))
+                if os.path.isfile(p)]
         if not libs:
             self.skipTest("no NVIDIA library with embedded fatbins on this machine")
         with open(libs[0], "rb") as fh:
@@ -183,7 +186,8 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(hostside.assess(a, "[heap]", "rw-p", "known-good (baseline hash)"), "")
 
 
-@unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists("/proc/self/mem"), "Linux /proc needed")
+@unittest.skipUnless((sys.platform.startswith("linux") and os.path.exists("/proc/self/mem")) or os.name == "nt",
+                     "Linux /proc or Windows ReadProcessMemory needed")
 class ProcessAcquisitionTests(unittest.TestCase):
     def test_capture_child_process_and_find_payload(self):
         """A child holds a GPU payload in its heap; the parent (allowed by ptrace_scope=1) captures it."""
@@ -193,18 +197,20 @@ class ProcessAcquisitionTests(unittest.TestCase):
                 fh.write(_payload_blob())
             child = subprocess.Popen([sys.executable, "-c",
                                       "import sys,time; b=bytearray(open(sys.argv[1],'rb').read()); "
-                                      "print('ready', flush=True); time.sleep(60)", payload],
+                                      "import os; print('ready', os.getpid(), flush=True); time.sleep(60)", payload],
                                      stdout=subprocess.PIPE)
             try:
-                self.assertEqual(child.stdout.readline().strip(), b"ready")
+                word, pid = child.stdout.readline().split()
+                self.assertEqual(word, b"ready")
+                pid = int(pid)  # a venv python.exe on Windows is a launcher: the payload lives in its child
                 out = os.path.join(d, "child.keto")
                 from keto.cli import main
                 rc = main(["-q", "--output-file", os.path.join(d, "log.txt"), "acquire", "--method", "process",
-                           "--pid", str(child.pid), "--out", out])
+                           "--pid", str(pid), "--out", out])
                 self.assertEqual(rc, 0)
                 load_plugins()
                 with Context(image=out) as ctx:
-                    self.assertEqual(ctx.metadata["process"]["pid"], child.pid)
+                    self.assertEqual(ctx.metadata["process"]["pid"], pid)
                     rows = PLUGINS["nvidia.artifactscan"](ctx, {"suspicious_only": True}).run().as_dicts()
                 kernels = " ".join(r["Kernels"] for r in rows)
                 self.assertIn("ethash_search", kernels)

@@ -16,10 +16,17 @@ systems, and records live state into hashed evidence containers that replay offl
   `zstandard` (zstd-compressed fatbins on Python < 3.14).
 - **Every NVIDIA generation from Kepler to Blackwell**: GMMU VER1/VER2/VER3 page tables, each generation's
   instance-block/RAMFC layout, Kepler/Maxwell/Volta+ runlist formats, 115 header-verified engine classes, and QMD
-  launch descriptors V00_06 to V05_00. The profile is detected from metadata, banners, or the structures in the
-  image alone (engine class ids, QMD version bytes, RAMFC layout).
-- 110 plugins, each documenting **what it does, how it does it, and its Volatility 3 counterpart**. All 167
-  Volatility 3 plugins are mapped to a GPU counterpart in [docs/VOLATILITY_MAPPING.md](docs/VOLATILITY_MAPPING.md).
+  launch descriptors V00_06 to V05_01. The profile is detected from metadata, banners, or the structures in the
+  image alone (engine class ids, QMD version bytes, RAMFC layout); a `--profile` that contradicts the evidence is
+  reported. Pushbuffer methods are named for the host, copy, compute, inline-to-memory, 3D, 2D and video classes
+  from NVIDIA's published class headers.
+- 116 plugins, each documenting **what it does, how it does it, and its Volatility 3 counterpart**. Each of the 167
+  Volatility 3 plugins is mapped in [docs/VOLATILITY_MAPPING.md](docs/VOLATILITY_MAPPING.md): 114 to a plugin
+  that declares it as its analogue, 53 by investigative role only (structures with no GPU twin, e.g. Windows
+  desktops or macOS kauth; there is no NVIDIA driver on current macOS, so the `mac.*` rows are role analogies).
+- Evidence containers carry per-segment hashes and a header digest over the metadata and segment table; `acquire`
+  prints an evidence fingerprint to record outside the container, never overwrites existing files, and `verify`
+  checks every container, live snapshots included.
 - Findings are scored, mapped to MITRE ATT&CK in `keto report`, and backed by shipped YARA rules
   (`yarascan --builtin`) and Sigma rules (`keto sigma`).
 
@@ -35,14 +42,16 @@ python keto.py -f demo/synthetic.keto -o out/ nvidia.surfaces          # recover
 python keto.py -f demo/synthetic.keto -o out/ report                   # every detector -> report.json/.html
 python keto.py --live -r pretty nvidia.pslist                         # live GPU processes (Linux/WSL)
 python keto.py --live -r pretty windows.gpuprocs                      # live GPU triage on Windows
-python keto.py acquire --method snapshot --out triage.keto             # record live state
+python keto.py acquire --method snapshot --out triage.keto             # record live state (prints a fingerprint)
+python keto.py -f triage.keto verify --expected-fingerprint <printed>  # chain of custody
 python keto.py -f triage.keto nvidia.malware.gpuxview                  # ...and analyse it offline later
 sudo python3 keto.py acquire --method kcore --out ram.keto             # Linux/WSL2 RAM + BTF + symbols
 python keto.py -f ram.keto wsl.dxgprocs                                # GPU process tree from host RAM
 python keto.py sigma --out sigma/                                     # Sigma rules for the SIEM
 ```
 
-Installed as a package (`pip install .`) the command is `keto`.
+Installed as a package (`pip install .`, which works offline: Keto builds with an in-tree, standard-library-only
+backend) the command is `keto`. `--workers N` sets how many processes scan large images (default: up to 8).
 
 ## What it can analyse
 
@@ -50,12 +59,12 @@ Installed as a package (`pip install .`) the command is `keto`.
 |---|---|---|
 | Physical VRAM image | external dump (hypervisor, PCIe DMA, GPU debugger) imported with `keto acquire --method import` | all `nvidia.*` image plugins |
 | CUDA residual memory | `keto acquire --method cuda`: uninitialised allocations copied back (remanence test) | scanners (cubins, PTX, secrets, keys, surfaces) |
-| Process memory | `keto acquire --method process --gpu-processes` (Linux/WSL), or any process dump | `nvidia.artifactscan` (GPU code incl. OpenCL/SPIR-V/DXBC, pushbuffers, QMDs, with provenance and baselines) |
+| Process memory | `keto acquire --method process --gpu-processes` (Linux/WSL via /proc, Windows via ReadProcessMemory), or any process dump | `nvidia.artifactscan` (GPU code incl. OpenCL/SPIR-V/DXBC, pushbuffers, QMDs, with provenance and baselines) |
 | Host RAM image (raw/LiME) | `--host-image`; resolves GPU mappings of system memory, and is scanned for GPU code | `nvidia.sysmemmap`, `nvidia.artifactscan` |
 | Linux / WSL2 kernel memory | `keto acquire --method kcore`, or AVML/LiME + `--btf`/`--kallsyms`, or `--kcore` live | `host.kernel`, `host.pslist`, `wsl.dxgprocs`, `wsl.dxgallocs` |
-| JIT cache on disk | `%APPDATA%\NVIDIA\ComputeCache`, `~/.nv/ComputeCache` | `nvidia.jitcache` |
+| JIT and shader caches on disk | `%APPDATA%\NVIDIA\ComputeCache`, `~/.nv/ComputeCache`, `%LOCALAPPDATA%\D3DSCache`, NVIDIA DX/GL caches (collected with `--path`, or this machine's by default) | `nvidia.jitcache`, `nvidia.shadercache` |
 | Live system | NVML + CUDA via ctypes, `/proc`, `/sys`, Windows Toolhelp/PDH/registry, allow-listed read-only commands | live plugins |
-| Live snapshot | `keto acquire --method snapshot`: every live query recorded, replayed byte-identically | all live plugins, offline |
+| Live snapshot | `keto acquire --method snapshot`: every live query recorded, replayed byte-identically | all live plugins offline, except the two that read process memory (`nvidia.procscan`, `nvidia.malware.libhooks`), which refuse on a snapshot |
 
 ## How a VRAM image is analysed
 
@@ -82,6 +91,9 @@ Installed as a package (`pip install .`) the command is `keto`.
    - host payloads hidden in VRAM: executables, script stagers, shellcode, file systems and archives
      (`nvidia.malware.hostcode`)
    - miners and crackers (`nvidia.malware.miner`), XRGB and opaque framebuffers (`nvidia.surfaces`)
+   - option ROM / VBIOS anomalies (`nvidia.vbios`): image-chain and PCIR consistency, vendor/device mismatches,
+     checksums, trailing data, BIT/version consistency, and comparison with a known-good ROM or hash list
+     (`--known-good`). Firmware signatures are not verified.
 
 ## Beyond VRAM
 
@@ -91,9 +103,30 @@ Installed as a package (`pip install .`) the command is `keto`.
 - **WSL2 kernel**: `wsl.dxgprocs` lists every process the GPU paravirtualisation driver knows (including those in
   PID namespaces, exited/hidden ones and unlinked objects) with devices, contexts, hardware queues and allocations;
   `wsl.dxgallocs` dumps and scans guest pages shared with the GPU.
-- **Windows**: `windows.gpuprocs` (GPU runtimes per process, per-process GPU engines and memory, windowless
-  compute, loader paths), `nvidia.malware.watchdog` (TDR tampering).
-- **Accounting and bypass**: `nvidia.malware.unaccounted` (GPU memory/activity no process owns),
+- **Windows**: `windows.gpuprocs` (GPU runtimes per process with Authenticode status of the image and each GPU
+  runtime DLL and its path, command lines from the PEB, per-process GPU engines and memory per named adapter,
+  windowless compute, loader paths), `nvidia.malware.watchdog` (TDR tampering), process capture with
+  `acquire --method process`. The generic live plugins have Windows implementations too: GPU processes and their
+  tree, command lines and environments (`nvidia.pslist`, `pstree`, `cmdline`, `envars`, `libs`), injection,
+  masquerading, deleted images, capture libraries, NVIDIA kernel drivers and display-class filter drivers
+  (`nvidia.driver`, `nvidia.modules`), driver registry parameters, services, OpenCL/Vulkan loader registrations
+  (`nvidia.autostart`), per-user compute caches, profiling and debugger exposure, Authenticode integrity of NVIDIA
+  files, process-memory GPU payload scans (`nvidia.procscan`), relocation-aware in-memory patch detection of
+  NVIDIA DLLs (`nvidia.malware.libhooks`) and GPU use without any GPU user-mode driver (`nvidia.malware.rawioctl`).
+  `nvidia.handles` lists each process's open handles to GPU objects and files (DxgKrnl/NVIDIA devices, the CUDA
+  driver's kernel archive opened at cuInit, shader and JIT caches in use, NVIDIA capture components), with name
+  queries isolated in a timed-out worker so a blocked file object cannot hang the run. Linux-only concepts refuse
+  with what to run instead: device nodes (`nvidia.devnodes`), container runtimes (`nvidia.containers`), VFIO binding
+  (`nvidia.malware.rawaccess`).
+- **Host page ownership**: `nvidia.malware.hostpages` (which process or kernel region owns each host page the GPU
+  maps), `wsl.dxgpageowners` (pages behind WSL2 GPU allocations).
+- **Execution evidence on disk**: `nvidia.shadercache` (D3D, NVIDIA DX/GL and Mesa shader caches: which programs
+  ran GPU shaders, when, on which adapter; the D3D cache records the program, while NVIDIA DX/GL caches of recent
+  drivers record no program name and are listed per cache directory), `nvidia.jitcache` (CUDA JIT cache),
+  `nvidia.envscan` (injection and loader variables in any image, ASCII and UTF-16). Without `--path` these read
+  the analyst machine's own caches, so `timeliner` only includes them for `--live`.
+- **Accounting and bypass**: `nvidia.malware.unaccounted` (GPU memory/activity no process owns, from NVML or the
+  Windows GPU counters), `nvidia.malware.scraper` / `nvidia.malware.fillscan` (remanence scraping),
   `nvidia.malware.rawaccess` (GPU bound to vfio-pci, VFIO handles, raw BAR mappings), compute-mode and ECC
   (Rowhammer exposure) checks.
 
@@ -113,11 +146,16 @@ Installed as a package (`pip install .`) the command is `keto`.
 python -m unittest discover -s tests -v
 ```
 
-220 tests, passing on Python 3.10, 3.13 and 3.14 (Windows, Ubuntu, Kali):
+393 tests, passing on Python 3.10 (Ubuntu/WSL2, as root, including the live `/proc/kcore` tests), 3.13 (Windows)
+and 3.14 (Kali), from the source tree and from an offline `pip install`; GitHub Actions runs them on Linux and
+Windows for Python 3.8 and 3.10–3.14:
 
 - the same ground-truth scenario built with **each generation's** structures (Kepler, Maxwell, Pascal, Volta,
-  Turing, Ampere, Ada, Hopper, Blackwell), checked end to end: profile detection from structures alone, channels,
-  runlists, address spaces, page sizes, launches, copies, QMD versions, the GPU timeline and malfind;
+  Turing, Ampere, Ada, Hopper, Blackwell, Rubin), checked end to end: profile detection from structures alone,
+  channels, runlists, address spaces, page sizes, launches, copies, QMD versions, the GPU timeline and malfind;
+- hostile and damaged evidence: truncated parser input at the end of an image, decompression bombs (deflate, LZ4,
+  zstd), tampered and truncated containers, no false channels/QMDs/surfaces on random data and system DLLs;
+- exact scanning at worker-part and chunk boundaries (multi-process vs single-process results are identical);
 - a synthetic Linux kernel image (KASLR, 4-level walks with a 2 MiB page, decoy banners) for the BTF reader and
   the dxgkrnl cross-view;
 - real data: QMDs written by the NVIDIA 592.82 driver, a JIT-compiled cubin, NVIDIA library fatbins, and (as root on
@@ -128,8 +166,16 @@ python -m unittest discover -s tests -v
 
 - NVIDIA only (by design). Structure layouts are verified against NVIDIA's published headers where they exist;
   every profile records its provenance (`profileinfo --provenance`), and unverified facts are labelled.
-- QMD V05_01 (Blackwell sub-task form) is recognised but shown raw. Blackwell USERD words other than GP_PUT are
-  assumed unchanged. GB2xx RAMFC holds no CHID.
+- The VRAM structure pipeline (channels, runlists, page tables, pushbuffers, launches) is tested against synthetic
+  images that `keto synth` builds from the same published layouts the parsers read, plus real QMDs, cubins and
+  fatbins; it has not been validated against a physical VRAM dump from real hardware. The Rubin profile assumes
+  Blackwell's classes and layouts (forward compatibility only).
+- Raw zstd frames are scanned for embedded cubins. In the NVIDIA 610.91 `nvcuda64.dll` the seven `28 B5 2F FD`
+  hits are not frames but 32-bit immediates of x86 `mov`/`cmp` instructions in the library's own zstd decoder (the
+  driver's 936 cubins there are stored uncompressed and are found directly); they fail to decode and are ignored.
+- QMD V05_01 (Blackwell task with sub-tasks) is decoded from the published layout; each sub-task's program is
+  analysed as its own launch. Blackwell USERD words other than GP_PUT are assumed unchanged. GB2xx RAMFC holds no
+  CHID.
 - Under Windows/WSL2 (WDDM) the driver scrubs device memory between allocations, so CUDA residual capture returns
   zeros there, and physical VRAM cannot be acquired from inside WSL2. WDDM does not report per-process GPU memory to
   NVML, so the memory accounting cross-view is not possible there (the plugin says so).

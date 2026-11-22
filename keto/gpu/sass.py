@@ -98,6 +98,20 @@ def find_epilogues(data: bytes, base: int = 0) -> List[int]:
     return [base + m.start() for m in EPILOGUE_RE.finditer(data) if m.start() % 16 == 0]
 
 
+def function_skeletons(data: bytes) -> set:
+    """Skeleton hashes of every SASS function in ``data`` (e.g. a cubin image), located exactly as the raw-SASS
+    sweep locates them (EXIT/BRA-self epilogue, then :func:`code_extent`), so a loaded copy of the same function
+    found in memory gets the same hash."""
+    out = set()
+    for off in find_epilogues(data):
+        try:
+            s, e = code_extent(data, off)
+        except (struct.error, ValueError):
+            continue
+        out.add(skeleton_hash(data[s:e]))
+    return out
+
+
 def code_extent(data: bytes, epilogue_off: int, max_back: int = 64 * 1024) -> Tuple[int, int]:
     """Given an epilogue offset inside ``data``, estimate the start and end of the
     function by walking backwards over code-like instructions and forwards over NOP padding."""

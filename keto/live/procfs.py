@@ -12,7 +12,6 @@ GPU_LIB_RE = re.compile(
     r"/(lib(?:cuda|nvidia-[\w.+-]+|nvcuvid|cudart|cublas\w*|cudnn\w*|cufft\w*|curand\w*|cusparse\w*|cusolver\w*|"
     r"nvrtc\w*|nvJitLink\w*|nccl\w*|nvToolsExt\w*|cupti\w*|cudadebugger|nvoptix\w*|dxcore|d3d12\w*|nvwgf2umx|"
     r"nvdxdlkernels|OpenCL|vulkan|GLX_nvidia|EGL_nvidia|nvcuda|nvidia-ml)(?:[\w.+-]*)\.so[\w.]*)(?: \(deleted\))?$")
-SUSPICIOUS_PATH_RE = re.compile(r"^(/tmp/|/var/tmp/|/dev/shm/|/run/user/|/memfd:|memfd:)|\(deleted\)$")
 CAPTURE_LIBS = ("libnvidia-fbc", "libnvidia-ifr", "libnvfbc", "libnvidia-encode")
 DEBUG_LIBS = ("libcudadebugger",)
 PROFILER_LIBS = ("libcupti", "libnvperf", "libnvToolsExt", "libnvtx")
@@ -66,25 +65,26 @@ def nvml_pids(nvml: dict) -> Dict[int, Set[str]]:
 
 def gpu_processes(source, include_nvml: bool = True) -> Dict[int, dict]:
     """Every process with evidence of GPU use: NVML process lists, open GPU device
-    nodes, or GPU runtime libraries mapped. Returns ``pid -> {proc, evidence}``."""
+    nodes, or GPU runtime libraries mapped. Returns ``pid -> {proc, evidence}``. The Keto process itself is
+    left out: loading NVML/CUDA to answer the query opens GPU device nodes, which is not evidence."""
     result: Dict[int, dict] = {}
     nv = nvml_pids(source.nvml()) if include_nvml else {}
     self_pid = (source.platform() or {}).get("self_pid")
     for pid in source.pids():
+        if pid == self_pid:
+            continue
         p = source.proc(pid)
         if p is None:
             continue
         ev: Set[str] = set(nv.get(pid, set()))
-        if pid == self_pid:
-            ev.add("self:keto")  # this tool loads NVML/CUDA to answer queries
         for fd, target in gpu_fds(p):
             ev.add("fd:" + target)
         for lib in has_lib(p, RUNTIME_LIBS):
             ev.add("lib:" + lib)
-        if ev and ev != {"self:keto"}:
+        if ev:
             result[pid] = {"proc": p, "evidence": ev}
     for pid, labels in nv.items():
-        if pid not in result:
+        if pid not in result and pid != self_pid:
             result[pid] = {"proc": None, "evidence": set(labels) | {"not-in-procfs"}}
     return result
 

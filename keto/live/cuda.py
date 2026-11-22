@@ -76,11 +76,18 @@ class CudaDriver:
             if fn is not None and fn(uuid, dev) == 0:
                 b = uuid.raw
                 uid = "GPU-%s-%s-%s-%s-%s" % (b[0:4].hex(), b[4:6].hex(), b[6:8].hex(), b[8:10].hex(), b[10:16].hex())
-            out.append({"ordinal": i, "name": name.value.decode(), "total_memory": total.value, "uuid": uid,
-                        "compute_capability": "%d.%d" % (attrs.get("cc_major", 0), attrs.get("cc_minor", 0)),
-                        "pci_bus_id": "%04x:%02x:%02x.0" % (attrs.get("pci_domain", 0), attrs.get("pci_bus", 0),
-                                                            attrs.get("pci_device", 0)),
-                        "attributes": attrs})
+            entry = {"ordinal": i, "name": name.value.decode(), "total_memory": total.value, "uuid": uid,
+                     "compute_capability": "%d.%d" % (attrs.get("cc_major", 0), attrs.get("cc_minor", 0)),
+                     "pci_bus_id": "%04x:%02x:%02x.0" % (attrs.get("pci_domain", 0), attrs.get("pci_bus", 0),
+                                                         attrs.get("pci_device", 0)),
+                     "attributes": attrs}
+            luid_fn = getattr(self.lib, "cuDeviceGetLuid", None) if sys.platform.startswith("win") else None
+            luid, mask = ctypes.create_string_buffer(8), ctypes.c_uint()
+            if luid_fn is not None and luid_fn(luid, ctypes.byref(mask), dev) == 0:
+                # the adapter LUID the Windows GPU counters and DXGI use (LowPart, then HighPart)
+                low, high = int.from_bytes(luid.raw[0:4], "little"), int.from_bytes(luid.raw[4:8], "little")
+                entry["luid"] = "0x%08X_0x%08X" % (high, low)
+            out.append(entry)
         return out
 
     # -- context / memory ---------------------------------------------------------
@@ -124,6 +131,11 @@ class CudaDriver:
 
     def write(self, ptr: int, data: bytes):
         self.check(self.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(ptr), data, ctypes.c_size_t(len(data))), "cuMemcpyHtoD")
+
+    def memset8(self, ptr: int, value: int, size: int):
+        self.check(self.lib.cuMemsetD8_v2(ctypes.c_uint64(ptr), ctypes.c_ubyte(value), ctypes.c_size_t(size)),
+                   "cuMemsetD8")
+        self.check(self.lib.cuCtxSynchronize(), "cuCtxSynchronize")
 
     # -- JIT ----------------------------------------------------------------------------
     def jit_ptx(self, ptx: bytes, name: str = "module.ptx") -> bytes:

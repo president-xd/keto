@@ -20,6 +20,19 @@ from keto.gpu.gmmu import SYS_COH, SYS_NCOH, VID
 #: NV_RAMIN_PAGE_DIR_BASE_TARGET / USERD / runlist INST targets
 RAMIN_TARGETS = {0: VID, 1: None, 2: SYS_COH, 3: SYS_NCOH}
 TARGET_CODES = {VID: 0, SYS_COH: 2, SYS_NCOH: 3}
+#: physical addresses are at most 52 bits wide on every generation (VER3 PTE/PDE address field 51:12)
+PHYS_ADDR_LIMIT = 1 << 52
+#: GPFIFO rings are 2**LIMIT2 entries; larger rings are not used by any driver
+MAX_GP_LIMIT2 = 24
+
+
+def plausible_pa(target: Optional[str], addr: int, vram_size: Optional[int]) -> bool:
+    """A page-directory / USERD pointer that can exist: valid target, non-zero, inside VRAM or 52-bit host space."""
+    if target is None or not addr:
+        return False
+    if target == VID:
+        return vram_size is None or addr < vram_size
+    return addr < PHYS_ADDR_LIMIT
 
 
 class SubcontextPdb:
@@ -37,6 +50,7 @@ class InstanceBlock:
         self.pa = pa
         self.score = 0
         self.reasons: List[str] = []
+        self.rejects: List[str] = []  # structural contradictions: any one makes the block invalid
         self.fields: Dict[str, int] = {}
         self.signature = 0
         self.signature_ok = False
@@ -68,7 +82,7 @@ class InstanceBlock:
 
     @property
     def valid(self) -> bool:
-        return self.signature_ok and self.pdb_aperture is not None and self.score >= 5
+        return self.signature_ok and self.pdb_aperture is not None and not self.rejects and self.score >= 5
 
     def gp_get(self) -> Optional[int]:
         return self.userd.get("gp_get", self.fields.get("gp_get"))
@@ -138,7 +152,7 @@ def parse_instance_block(layer: DataLayer, pa: int, profile, vram_size: Optional
     lo, hi = _w(data, ramin.get("page_dir_base_lo")), _w(data, ramin.get("page_dir_base_hi"))
     target, addr, vol, ver2, big, replay = _decode_pdb_word(lo, hi)
     ib.pdb_aperture, ib.pdb, ib.pdb_vol, ib.pdb_ver2, ib.big_page_size, ib.fault_replay =         target, addr, vol, ver2, big, replay
-    if target is not None and addr and addr % 4096 == 0 and (target != VID or vram_size is None or addr < vram_size):
+    if addr % 4096 == 0 and plausible_pa(target, addr, vram_size):
         ib.score += 2
         ib.reasons.append("page directory %s:0x%x" % (target, addr))
     else:
@@ -149,10 +163,24 @@ def parse_instance_block(layer: DataLayer, pa: int, profile, vram_size: Optional
     gpl, gph = ib.fields.get("gp_base_lo", 0), ib.fields.get("gp_base_hi", 0)
     hi_bits = fc.get("gp_base_hi_bits", 8)
     ib.gp_base_va = (gpl & 0xFFFFFFF8) | ((gph & ((1 << hi_bits) - 1)) << 32)
-    ib.gp_limit2 = _field(data, fc.get("gp_limit2") or [fc.get("gp_base_hi"), 20, 16])
-    if ib.gp_base_va and 1 <= ib.gp_limit2 <= 24:
+    limit_spec = fc.get("gp_limit2") or [fc.get("gp_base_hi"), 20, 16]
+    ib.gp_limit2 = _field(data, limit_spec)
+    if ib.gp_base_va and 1 <= ib.gp_limit2 <= MAX_GP_LIMIT2:
         ib.score += 2
         ib.reasons.append("GPFIFO 0x%x x%d" % (ib.gp_base_va, ib.gp_entries))
+    else:
+        ib.rejects.append("no GPFIFO ring (base 0x%x, LIMIT2 %d)" % (ib.gp_base_va, ib.gp_limit2))
+    # GP_BASE bits 2:0 and the GP_BASE_HI bits that hold neither OFFSET_HI nor LIMIT2 are reserved (zero)
+    used_hi = (1 << hi_bits) - 1
+    if limit_spec[0] == fc.get("gp_base_hi"):
+        used_hi |= ((1 << (limit_spec[1] - limit_spec[2] + 1)) - 1) << limit_spec[2]
+    if gpl & 7 or gph & ~used_hi:
+        ib.rejects.append("GP_BASE reserved bits set")
+    # the saved GP_GET / GP_PUT are ring indices
+    n = ib.gp_entries
+    for name in ("gp_get", "gp_put"):
+        if n and name in ib.fields and ib.fields[name] >= n:
+            ib.rejects.append("RAMFC %s %d outside the %d-entry ring" % (name.upper(), ib.fields[name], n))
 
     # USERD (NV_PPBDMA_USERD: target 1:0, addr 31:9; hi 7:0) - only in RAMFC up to Turing; from Ampere on
     # it is known only from the runlist entry (filled in by discovery)
@@ -160,8 +188,10 @@ def parse_instance_block(layer: DataLayer, pa: int, profile, vram_size: Optional
         ul, uh = ib.fields.get("userd_lo", 0), ib.fields.get("userd_hi", 0)
         ib.userd_aperture = RAMIN_TARGETS.get(ul & 3)
         ib.userd_addr = (ul & 0xFFFFFE00) | ((uh & 0xFF) << 32)
-        if ib.userd_addr and ib.userd_aperture:
+        if ib.userd_addr and ib.userd_aperture and not uh >> 8:
             ib.score += 1
+        else:
+            ib.rejects.append("no valid USERD pointer")
 
     bit = fc.get("hce_priv_bit")
     if bit is not None and "hce_ctrl" in ib.fields:
@@ -190,16 +220,21 @@ def parse_instance_block(layer: DataLayer, pa: int, profile, vram_size: Optional
     if count and "sc_pdb_valid" in ramin:
         mask = _w(data, ramin["sc_pdb_valid"]) | (_w(data, ramin["sc_pdb_valid"] + 4) << 32)
         base, stride = ramin["sc_page_dir_base"], ramin.get("sc_stride", 16)
+        bad = 0
         for veid in range(count):
             if not mask >> veid & 1:
                 continue
             o = base + veid * stride
             slo, shi, sw2 = _w(data, o), _w(data, o + 4), _w(data, o + 8)
             st, saddr, _, sver2, sbig, _ = _decode_pdb_word(slo, shi)
-            if st is None or not saddr:
+            if not plausible_pa(st, saddr, vram_size):
+                bad += 1  # drivers fill every subcontext they mark valid
                 continue
             ib.subcontexts.append(SubcontextPdb(veid, st, saddr, sver2, sbig, bool(sw2 >> 31), sw2 & 0xFFFFF,
                                                 (slo, shi, sw2)))
+        if bad:
+            ib.rejects.append("%d subcontext page directory entr%s marked valid but invalid"
+                              % (bad, "y" if bad == 1 else "ies"))
     return ib
 
 
