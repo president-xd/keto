@@ -19,15 +19,15 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `timeliner` | `nvidia.gputimeline`, `timeliner` | declared analogue |
 | `vmscan` | `nvidia.mig` | declared analogue |
 | `yarascan` | `yarascan` | declared analogue |
-| `windows.info` | `nvidia.devices`, `nvidia.info` | declared analogue |
+| `windows.info` | `nvidia.devices`, `nvidia.info`, `windows.kernel.info` | declared analogue |
 | `windows.crashinfo` | `nvidia.bugreport`, `nvidia.info`, `nvidia.xid` | declared analogue |
 | `windows.kpcrs` | `nvidia.contexts`, `nvidia.engines` | declared analogue |
 | `windows.virtmap` | `nvidia.vamap` | declared analogue |
-| `windows.pslist` | `nvidia.pslist`, `nvidia.runlist`, `windows.gpuprocs` | declared analogue |
-| `windows.psscan` | `nvidia.chanscan` | declared analogue |
+| `windows.pslist` | `nvidia.pslist`, `nvidia.runlist`, `windows.gpuprocs`, `windows.kernel.gpuprocs`, `windows.kernel.procdump`, `windows.kernel.pslist` | declared analogue |
+| `windows.psscan` | `nvidia.chanscan`, `windows.kernel.psscan` | declared analogue |
 | `windows.pstree` | `nvidia.chantree`, `nvidia.pstree` | declared analogue |
 | `windows.cmdline` | `nvidia.cmdline` | declared analogue |
-| `windows.envars` | `nvidia.envars`, `nvidia.envscan` | declared analogue |
+| `windows.envars` | `nvidia.envars`, `nvidia.envscan`, `windows.kernel.envars` | declared analogue |
 | `windows.sessions` | `nvidia.sessions` | declared analogue |
 | `windows.joblinks` | `nvidia.tsglist` | declared analogue |
 | `windows.threads` | `nvidia.gpfifo`, `nvidia.launches` | declared analogue |
@@ -38,23 +38,23 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `windows.privileges` | `nvidia.privileges` | declared analogue |
 | `windows.getsids` | `nvidia.pslist`, `nvidia.devnodes` | by role: who owns GPU work: process UIDs and GPU device-node ownership |
 | `windows.getservicesids` | `nvidia.daemons` | by role: identity/state of GPU service processes |
-| `windows.dlllist` | `nvidia.kernels`, `nvidia.libs`, `windows.gpuprocs` | declared analogue |
-| `windows.modules` | `nvidia.driver`, `nvidia.modules` | declared analogue |
+| `windows.dlllist` | `nvidia.kernels`, `nvidia.libs`, `windows.gpuprocs`, `windows.kernel.gpuprocs` | declared analogue |
+| `windows.modules` | `nvidia.driver`, `nvidia.modules`, `windows.kernel.modules` | declared analogue |
 | `windows.modscan` | `nvidia.cubinscan` | declared analogue |
 | `windows.unloadedmodules` | `nvidia.fatbinscan` | declared analogue |
 | `windows.pedump` | `nvidia.cubindump` | declared analogue |
 | `windows.pe_symbols` | `nvidia.symbols` | declared analogue |
 | `windows.iat` | `nvidia.imports` | declared analogue |
 | `windows.verinfo` | `nvidia.cubininfo` | declared analogue |
-| `windows.vadinfo` | `nvidia.addrspaces`, `nvidia.mappings` | declared analogue |
+| `windows.vadinfo` | `nvidia.addrspaces`, `nvidia.mappings`, `windows.kernel.vadinfo` | declared analogue |
 | `windows.vadwalk` | `nvidia.ptwalk` | declared analogue |
-| `windows.memmap` | `nvidia.memmap` | declared analogue |
+| `windows.memmap` | `nvidia.memmap`, `windows.kernel.procdump` | declared analogue |
 | `windows.vadyarascan` | `nvidia.procscan`, `nvidia.vayarascan` | declared analogue |
 | `windows.vadregexscan` | `nvidia.varegexscan` | declared analogue |
 | `windows.strings` | `nvidia.strings` | declared analogue |
 | `windows.bigpools` | `nvidia.physmap` | declared analogue |
 | `windows.poolscanner` | `nvidia.artifactscan`, `nvidia.physmap` | declared analogue |
-| `windows.handles` | `nvidia.handles` | declared analogue |
+| `windows.handles` | `nvidia.handles`, `windows.kernel.gpuprocs`, `windows.kernel.handles` | declared analogue |
 | `windows.filescan` | `nvidia.ptxscan` | declared analogue |
 | `windows.mutantscan` | `nvidia.semaphores` | declared analogue |
 | `windows.symlinkscan` | `nvidia.sysmemmap` | declared analogue |
@@ -66,7 +66,7 @@ Every working Volatility 3 plugin listed in the supplied reference (167), with t
 | `windows.callbacks` | `nvidia.notifiers` | declared analogue |
 | `windows.timers` | `nvidia.timeslices` | declared analogue |
 | `windows.driverscan` | `nvidia.driver` | declared analogue |
-| `windows.driverirp` | `nvidia.devnodes` | declared analogue |
+| `windows.driverirp` | `nvidia.devnodes`, `windows.kernel.driverirp` | declared analogue |
 | `windows.devicetree` | `nvidia.devicetree`, `nvidia.devnodes` | declared analogue |
 | `windows.mbrscan` | `nvidia.vbios` | declared analogue |
 | `windows.netscan` | `nvidia.malware.exfil`, `nvidia.nvlink` | declared analogue |

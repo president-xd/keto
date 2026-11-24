@@ -168,6 +168,20 @@ RULES = [
          "high", sev_col="Severity", when=lambda r: r.get("Severity") == "high", evidence="kernel"),
     Rule("wsl.dxgallocs", "GPU payload in guest pages shared with the GPU", ["T1620", "T1027"], "high",
          when=lambda r: isinstance(r.get("Artefacts"), str) and bool(r.get("Artefacts")), evidence="kernel"),
+    # ---- Windows kernel memory images
+    Rule("windows.kernel.psscan", "Process unlinked from the active process list (DKOM)", ["T1014", "T1564"], "high",
+         when=lambda r: "unlinked" in str(r.get("Note") or ""), evidence="windows",
+         recommendation="Dump the process (windows.kernel.procdump) and check its GPU use with "
+                        "windows.kernel.gpuprocs --hidden."),
+    Rule("windows.kernel.driverirp", "Driver dispatch entry redirected outside its driver", ["T1014"],
+         lambda r: "high" if "outside every loaded module" in str(r.get("Finding")) else "medium",
+         when=lambda r: isinstance(r.get("Finding"), str) and bool(r.get("Finding")), evidence="windows",
+         recommendation="Identify the module owning the target; a hooked GPU driver can hide or intercept GPU work."),
+    Rule("windows.kernel.envars", "CUDA/NVTX injection or GPU loader override in a process environment", ["T1574"],
+         "medium", sev_col="Severity", when=lambda r: r.get("Severity") in ("high", "medium"), evidence="windows"),
+    Rule("windows.kernel.gpuprocs", "GPU compute runtime loaded from a user-writable path", ["T1574", "T1496"],
+         "high", when=lambda r: isinstance(r.get("Findings"), str) and bool(r.get("Findings")), evidence="windows",
+         recommendation="Verify the runtime DLL's signature and dump the process with windows.kernel.procdump."),
 ]
 
 
@@ -201,6 +215,9 @@ def _applicable(rule: Rule, ctx) -> bool:
         return False
     if rule.evidence == "kernel":
         return _has_kernel(ctx)
+    if rule.evidence == "windows":
+        from keto.winmem.session import looks_windows
+        return looks_windows(ctx)
     if "image" in cls.SOURCES and rule.evidence != "any" and rule.evidence != evidence_kind(ctx):
         return False
     if "image" in cls.SOURCES and ctx.has_image():
@@ -216,7 +233,7 @@ def build(ctx, baseline: Optional[str] = None, include_live: bool = True) -> dic
     started = time.time()
     for rule in RULES:
         if not _applicable(rule, ctx) or (not include_live and "image" not in PLUGINS[rule.plugin].SOURCES
-                                          and rule.evidence != "kernel"):
+                                          and rule.evidence not in ("kernel", "windows")):
             continue
         opts = dict(rule.opts)
         if baseline and rule.plugin in ("nvidia.artifactscan", "nvidia.procscan"):

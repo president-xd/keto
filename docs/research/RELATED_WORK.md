@@ -580,7 +580,12 @@ summary.
 
 **Licence:** MIT (GitHub API).
 
-**Keto:** do not implement this. Document a dead-box SOP and import the result with base-offset and 0x1700 before/after metadata.
+**Keto:** implemented as `acquire --method pramin` with the soundness gaps closed as far as software allows. It
+refuses while a GPU driver is bound unless `--allow-bound-driver` is given (recorded as `driver_active`). It
+saves the window register, verifies every write, re-reads the register after each aperture read to detect the
+driver moving it, and restores it on every exit path. The window register for each architecture (0x1700 up to
+Ada, 0x10FD40 from Hopper) and the PRI error patterns are cited in NVIDIA_HW_FACTS.md Topic 7. Validated against
+an emulated BAR0 only (docs/ACQUISITION.md, PRAMIN SOP).
 
 ### [A2] nouveau debugfs / nvkm
 
@@ -717,7 +722,7 @@ None of these is documented to contain VRAM. A `!dxgkdx`-style debugger extensio
 
 | Method | Reach | Platform | Privilege | State change | Keto import |
 |---|---|---|---|---|---|
-| PRAMIN window (`nvadownload`) | all physical VRAM | Linux | raw BAR0 | writes 0x1700 on every read | raw import exists; add base and window metadata |
+| PRAMIN window (`nvadownload`) | all physical VRAM | Linux | raw BAR0 | writes 0x1700 on every read | `acquire --method pramin` (window saved, verified, restored) |
 | sysfs `resource1` (BAR1) mmap | BAR1-mapped pages only | Linux | root | low (reads) | add `bar1` acquisition with BAR1 size/ReBAR metadata |
 | VFIO region read / tinygrad-style userspace driver | BAR0/BAR1, potentially all VRAM | Linux | root, driver unbind | high (driver unbound; GPU re-initialised) | raw import; SOP needed |
 | `dump_fb` + patched 343.13 driver | VRAM range | Linux, Maxwell era | root | patched driver | raw import; Maxwell profile missing |

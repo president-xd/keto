@@ -39,6 +39,8 @@ class Context:
         self._live = None
         self._vram_size_override = vram_size
         self.host_metadata: Dict[str, Any] = {}
+        #: layer name -> format metadata of the physical-memory images opened through keto.formats.memimage
+        self.image_formats: Dict[str, Dict[str, Any]] = {}
         if snapshot and not os.path.isfile(snapshot):
             raise RequirementError("snapshot not found: %s" % snapshot)
         try:
@@ -67,6 +69,18 @@ class Context:
             raise RequirementError("%s is empty: %s" % (what, path))
 
     # -- image handling -------------------------------------------------------
+    def _open_memimage(self, name: str, path: str) -> bool:
+        """Open a crash dump / ELF core / VMware / hibernation image as layer ``name``; False for other files."""
+        from keto.formats import memimage
+        if memimage.detect(path) not in memimage.PHYSICAL_FORMATS:
+            return False
+        layer, meta = memimage.open_memory_image(name, path)
+        self.layers[name] = layer
+        self.image_formats[name] = meta
+        for warning in meta.get("warnings", []):
+            log.warning("%s (%s): %s", path, meta["format"], warning)
+        return True
+
     def _open_image(self, path: str):
         from keto.formats.container import Container, is_container, is_lime, open_lime
         self._check_input(path, "image")
@@ -82,6 +96,8 @@ class Context:
                     break
         elif is_lime(path):
             self.layers["physical"] = open_lime("physical", path)
+            self.primary_name = "physical"
+        elif self._open_memimage("physical", path):
             self.primary_name = "physical"
         else:
             self.layers["vram"] = FileLayer("vram", path)
@@ -107,7 +123,7 @@ class Context:
             if "kbtf" in layers:
                 self.layers["kbtf"] = layers["kbtf"]
             self.host_metadata = cont.metadata
-        else:
+        elif not self._open_memimage("sysmem", path):
             self.layers["sysmem"] = FileLayer("sysmem", path)
 
     def has_image(self) -> bool:

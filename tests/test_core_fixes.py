@@ -435,6 +435,34 @@ class _Chunky(DataLayer):
         return len(self.data)
 
 
+class SparseLayerPerformanceTests(unittest.TestCase):
+    """A real Windows live dump has ~280,000 runs of pages. Rebuilding the starts list on every read made a
+    self-profile take 405 s, and one worker task per run made a pool-tag scan take 437 s; both are now
+    proportional to the data, not to runs x reads."""
+
+    def test_starts_built_once_per_ranges_list(self):
+        from keto.framework.layers import SegmentedLayer, BytesLayer
+        base = BytesLayer("b", bytes(range(256)) * 64)
+        layer = SegmentedLayer("s", [(i * 0x2000, 0x10, base, i * 0x10) for i in range(500)])
+        first = layer._starts()
+        self.assertIs(layer._starts(), first)
+        self.assertEqual(layer.read(0x2000 * 7, 4), bytes(range(0x70, 0x74)))
+        self.assertIs(layer._starts(), first)
+
+    def test_many_small_regions_are_batched(self):
+        specs = [(i * 0x10000, "f.bin", i * 0x1000, 0x1000) for i in range(5000)]
+        tasks = parallel.plan(specs, overlap=16, part_size=1 << 20)
+        self.assertEqual(len(tasks), 20)  # 5000 x 4 KiB in 1 MiB tasks, not 5000 tasks
+        pieces = [p for _path, ps in tasks for p in ps]
+        self.assertEqual(len(pieces), 5000)
+        for (fstart, fend, keep_from, limit, loff), (l_off, _p, f_off, length) in zip(pieces, specs):
+            self.assertEqual((fstart, fend, keep_from, limit, loff), (f_off, f_off + length, l_off, l_off + length,
+                                                                      l_off))  # each region scanned on its own
+        big = parallel.plan([(0, "f.bin", 0, 3 << 20)], overlap=16, part_size=1 << 20)
+        self.assertEqual([len(ps) for _p, ps in big], [1, 1, 1])  # a large region is still split with overlap
+        self.assertEqual(big[1][1][0][:2], ((1 << 20) - 16, (2 << 20) + 16))
+
+
 class ScanBoundaryTests(unittest.TestCase):
     """IMG-1: no phantom matches at worker-part or chunk boundaries; hits in offset order."""
 
@@ -475,6 +503,21 @@ class ScanBoundaryTests(unittest.TestCase):
                 os.environ["KETO_WORKERS"] = old[2]
             layer.close()
             parallel._shutdown()
+
+    def test_shutdown_stops_the_workers(self):
+        """On Python 3.8, shutdown(wait=False) left the workers running and the interpreter never exited."""
+        pool = parallel._pool(2)
+        self.assertEqual(pool.submit(int, "7").result(timeout=60), 7)  # starts the workers
+        procs = list(pool._processes.values())
+        try:
+            parallel._shutdown()
+            for p in procs:
+                p.join(30)
+            self.assertEqual([p for p in procs if p.is_alive()], [])
+        finally:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
 
 
 class ProfileTests(unittest.TestCase):

@@ -219,8 +219,10 @@ def acquire_kcore(args, out, base_metadata) -> int:
         _drop_written(writer.fh, dropped)
     except BaseException as exc:
         stop = "interrupted: %s" % (type(exc).__name__)
+        meta["acquisition"]["status"] = "incomplete: %s: %s" % (type(exc).__name__, exc)
         raise
     finally:
+        meta["acquisition"].setdefault("status", "complete")  # a --max-bytes / --phys-range limit is recorded below
         acquired = [(p, s) for p, s in acquired if s]
         meta["kernel"]["own_pages_omitted"] = own.omitted
         if own.omitted:

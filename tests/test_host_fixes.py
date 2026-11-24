@@ -246,6 +246,7 @@ class KcoreAcquisitionTests(_Tmp):
         meta = c.metadata["kernel"]
         self.assertEqual(meta["phys_base"], "0x%x" % TRUTH["phys_base"])
         self.assertNotIn("acquired_ranges", meta)
+        self.assertEqual(c.metadata["acquisition"]["status"], "complete")
         segs = self.sysmem(c)
         self.assertLessEqual(max(s.length for s in segs), 2 * PAGE + kcore.GAP_PAGES * PAGE)
         # runs longer than SEGMENT_MAX continue in an adjacent segment (unsplit runs are separated by zero pages)

@@ -57,11 +57,12 @@ backend) the command is `keto`. `--workers N` sets how many processes scan large
 
 | Evidence | How it is obtained | Plugins that use it |
 |---|---|---|
-| Physical VRAM image | external dump (hypervisor, PCIe DMA, GPU debugger) imported with `keto acquire --method import` | all `nvidia.*` image plugins |
+| Physical VRAM image | external dump (hypervisor, PCIe DMA, GPU debugger) imported with `keto acquire --method import`, or `keto acquire --method pramin` (bare-metal Linux, root, driver unbound: reads VRAM through the BAR0 PRAMIN window; validated against an emulator only, see docs/ACQUISITION.md) | all `nvidia.*` image plugins |
 | CUDA residual memory | `keto acquire --method cuda`: uninitialised allocations copied back (remanence test) | scanners (cubins, PTX, secrets, keys, surfaces) |
 | Process memory | `keto acquire --method process --gpu-processes` (Linux/WSL via /proc, Windows via ReadProcessMemory), or any process dump | `nvidia.artifactscan` (GPU code incl. OpenCL/SPIR-V/DXBC, pushbuffers, QMDs, with provenance and baselines) |
 | Host RAM image (raw/LiME) | `--host-image`; resolves GPU mappings of system memory, and is scanned for GPU code | `nvidia.sysmemmap`, `nvidia.artifactscan` |
 | Linux / WSL2 kernel memory | `keto acquire --method kcore`, or AVML/LiME + `--btf`/`--kallsyms`, or `--kcore` live | `host.kernel`, `host.pslist`, `wsl.dxgprocs`, `wsl.dxgallocs` |
+| Windows kernel memory | `keto acquire --method livedump` (elevated, no third-party driver), or any raw image, crash/live dump, hiberfil.sys, QEMU/VirtualBox ELF core or VMware snapshot; symbols from a local PDB/ISF, or derived from the kernel itself when none is available | `windows.kernel.*` (docs/WINDOWS.md) |
 | JIT and shader caches on disk | `%APPDATA%\NVIDIA\ComputeCache`, `~/.nv/ComputeCache`, `%LOCALAPPDATA%\D3DSCache`, NVIDIA DX/GL caches (collected with `--path`, or this machine's by default) | `nvidia.jitcache`, `nvidia.shadercache` |
 | Live system | NVML + CUDA via ctypes, `/proc`, `/sys`, Windows Toolhelp/PDH/registry, allow-listed read-only commands | live plugins |
 | Live snapshot | `keto acquire --method snapshot`: every live query recorded, replayed byte-identically | all live plugins offline, except the two that read process memory (`nvidia.procscan`, `nvidia.malware.libhooks`), which refuse on a snapshot |
@@ -103,6 +104,12 @@ backend) the command is `keto`. `--workers N` sets how many processes scan large
 - **WSL2 kernel**: `wsl.dxgprocs` lists every process the GPU paravirtualisation driver knows (including those in
   PID namespaces, exited/hidden ones and unlinked objects) with devices, contexts, hardware queues and allocations;
   `wsl.dxgallocs` dumps and scans guest pages shared with the GPU.
+- **Windows kernel memory** (docs/WINDOWS.md): `windows.kernel.pslist` / `psscan` (processes, including ones
+  unlinked from the active list) / `modules` / `handles` / `vadinfo` / `envars` / `driverirp` (dispatch entries
+  outside their driver, framework dispatch recognised) / `gpuprocs` (graphics-kernel process objects, GPU runtimes,
+  GPU device handles, hidden GPU processes) / `procdump` (a process as a container for `nvidia.artifactscan`).
+  Works without network access: when no PDB for the build is available, types are derived from the kernel image
+  (accessor machine code, structural checks, layouts stable from Windows 10 1809 to 11 25H2).
 - **Windows**: `windows.gpuprocs` (GPU runtimes per process with Authenticode status of the image and each GPU
   runtime DLL and its path, command lines from the PEB, per-process GPU engines and memory per named adapter,
   windowless compute, loader paths), `nvidia.malware.watchdog` (TDR tampering), process capture with
@@ -137,6 +144,7 @@ backend) the command is `keto`. `--workers N` sets how many processes scan large
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): framework design (layers, profiles, discovery, live sources, host memory).
 - [docs/FORMATS.md](docs/FORMATS.md): evidence container, profile format, decoded NVIDIA structures and their sources.
 - [docs/ACQUISITION.md](docs/ACQUISITION.md): acquisition methods, forensic soundness, platform findings.
+- [docs/WINDOWS.md](docs/WINDOWS.md): Windows kernel memory: inputs, kernel location, symbols and the self-profile.
 - [docs/research/](docs/research/): verified hardware and command-stream facts with sources, host-side detection
   research, and the survey of prior work with the gap analysis this release closes.
 
@@ -146,7 +154,7 @@ backend) the command is `keto`. `--workers N` sets how many processes scan large
 python -m unittest discover -s tests -v
 ```
 
-393 tests, passing on Python 3.10 (Ubuntu/WSL2, as root, including the live `/proc/kcore` tests), 3.13 (Windows)
+529 tests, passing on Python 3.10 (Ubuntu/WSL2, as root, including the live `/proc/kcore` tests), 3.13 (Windows)
 and 3.14 (Kali), from the source tree and from an offline `pip install`; GitHub Actions runs them on Linux and
 Windows for Python 3.8 and 3.10–3.14:
 
@@ -160,7 +168,13 @@ Windows for Python 3.8 and 3.10–3.14:
   the dxgkrnl cross-view;
 - real data: QMDs written by the NVIDIA 592.82 driver, a JIT-compiled cubin, NVIDIA library fatbins, and (as root on
   Linux) the live kernel through `/proc/kcore`;
-- live plugins against a fake Linux and Windows system, with snapshot record/replay round trips.
+- live plugins against a fake Linux and Windows system, with snapshot record/replay round trips;
+- a synthetic Windows x64 kernel (non-contiguous frames, low stub, self-referencing PML4, transition/prototype/
+  page-file PTEs, DKOM-unlinked and exited processes, handle tables, VAD trees, a hooked and a KMDF driver) analysed
+  with a symbol file and with the self-profile, as a raw image and as a live-kernel crash dump;
+- the PDB reader on real Microsoft PDBs, the self-profile's accessor decoder on the machine's real `ntoskrnl.exe`,
+  and the Xpress/Huffman/LZNT1 decoders byte for byte against Windows' own `RtlCompressBuffer`;
+- PRAMIN acquisition against an emulated BAR0 (window discipline, races, PRI errors, VRAM plugins on the result).
 
 ## Scope and honesty notes
 
@@ -179,7 +193,10 @@ Windows for Python 3.8 and 3.10–3.14:
 - Under Windows/WSL2 (WDDM) the driver scrubs device memory between allocations, so CUDA residual capture returns
   zeros there, and physical VRAM cannot be acquired from inside WSL2. WDDM does not report per-process GPU memory to
   NVML, so the memory accounting cross-view is not possible there (the plugin says so).
-- Host kernel memory support covers Linux/WSL2 on x86-64. Native-Linux NVIDIA RM objects (`g_resServ`, NVOC) and
-  Windows kernel GPU objects (`_EPROCESS.DxgProcess`) are researched in docs/research/HOST_SIDE_DETECTION.md but not
-  implemented: they could not be validated on the project's hardware.
+- Host kernel memory covers Linux/WSL2 and Windows on x86-64. Windows analysis was validated on a live dump of a
+  real Windows 11 build 26300 kernel without a PDB: process IDs, parents and creation times match the running
+  system for every surviving process, and every running driver is in the module list. The internals of
+  `dxgkrnl.sys` objects are not public (no types in its PDB), so the Windows GPU view uses
+  `_EPROCESS.DxgProcess`, handles and mapped GPU runtimes. Native-Linux NVIDIA RM objects (`g_resServ`, NVOC) are
+  researched in docs/research/HOST_SIDE_DETECTION.md but not implemented: they could not be validated here.
 - Licence: see `pyproject.toml` (currently marked proprietary pending the owner's choice).

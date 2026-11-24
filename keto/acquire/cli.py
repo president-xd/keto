@@ -14,10 +14,15 @@ Methods
   process   Capture GPU processes' address spaces through /proc/<pid>/mem.
   kcore     Physical RAM of the running Linux/WSL2 kernel through /proc/kcore
             (root), with the kernel's BTF and symbols for offline analysis.
+  pramin    Physical VRAM through the BAR0 PRAMIN window (Linux, root; see
+            keto/acquire/pramin.py and docs/ACQUISITION.md).
+  livedump  Windows live kernel memory dump (NtSystemDebugControl, elevated),
+            converted to physical-memory segments (keto/acquire/livedump.py).
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import json
 import os
@@ -32,7 +37,14 @@ from keto.framework.util import parse_size
 
 def add_acquire_parser(sub):
     ap = sub.add_parser("acquire", help="acquire evidence into a .keto container")
-    ap.add_argument("--method", choices=("snapshot", "cuda", "import", "process", "kcore"), default="snapshot")
+    ap.add_argument("--method", choices=("snapshot", "cuda", "import", "process", "kcore", "pramin", "livedump"),
+                    default="snapshot")
+    ap.add_argument("--include-user-pages", action="store_true",
+                    help="livedump method: also capture user-mode memory (needed for process memory, PEB and "
+                         "environment analysis)")
+    ap.add_argument("--hypervisor-pages", action="store_true", help="livedump method: also capture hypervisor pages")
+    ap.add_argument("--keep-dump", action="store_true",
+                    help="livedump method: keep Windows' original .dmp next to the container")
     ap.add_argument("--pid", type=int, action="append", default=[],
                     help="process method: PID to capture (repeatable; one container per PID)")
     ap.add_argument("--gpu-processes", action="store_true",
@@ -64,6 +76,24 @@ def add_acquire_parser(sub):
     ap.add_argument("--live-device", action="store_true",
                     help="import method: record THIS machine's GPU (NVML/CUDA) as the dump's device; only correct "
                          "when the dump was taken from this machine's GPU")
+    ap.add_argument("--pci", metavar="BDF", help="pramin method: PCI address of the GPU (e.g. 0000:01:00.0); "
+                                                 "required when there are several NVIDIA GPUs")
+    ap.add_argument("--allow-bound-driver", action="store_true",
+                    help="pramin method: proceed although a GPU driver is bound. RISK: the driver's own PRAMIN "
+                         "accesses during the acquisition can corrupt VRAM or hang the GPU; recorded as "
+                         "driver_active=true")
+    ap.add_argument("--start", type=parse_size, default=None,
+                    help="pramin method: first VRAM address to read (default 0; rounded down to 4 KiB)")
+    ap.add_argument("--length", type=parse_size, default=None,
+                    help="pramin method: bytes of VRAM to read (default: up to the VRAM size; rounded up to 4 KiB)")
+    ap.add_argument("--passes", type=int, default=1,
+                    help="pramin method: read the range N times; pages that change between passes are recorded "
+                         "(only the first pass is stored)")
+    ap.add_argument("--bulk-mmio", action="store_true",
+                    help="pramin method: read the aperture with memcpy instead of 32-bit loads (faster; the CPU may "
+                         "issue wider loads to BAR0)")
+    ap.add_argument("--vram-size", type=parse_size, default=argparse.SUPPRESS,
+                    help="pramin method: VRAM size when no cited register or NVML gives it (e.g. 8G)")
 
 
 def check_output(path: str, force: bool, inputs=()) -> None:
@@ -358,6 +388,25 @@ def run_acquire(args, out) -> int:
     if args.method == "kcore":
         from keto.acquire.kcore import acquire_kcore
         return acquire_kcore(args, out, _base_metadata(args))
+    if args.method == "pramin":
+        from keto.acquire.pramin import acquire_pramin
+        return acquire_pramin(args, out, _base_metadata(args))
+    if args.method == "livedump":
+        from keto.acquire.livedump import acquire_livedump
+        return acquire_livedump(args, out, _base_metadata(args))
+    if args.method == "import" and args.space == "sysmem":
+        from keto.formats.memimage import detect
+        fmt = detect(args.input)
+        if fmt not in (None, "container"):  # a crash dump, hiberfil, ELF core, VMware or LiME image: map pages
+            from keto.acquire.livedump import dump_to_container
+            meta = _base_metadata(args)
+            meta["acquisition"]["source_file"] = os.path.abspath(args.input)
+            meta["acquisition"]["source_format"] = fmt
+            writer = dump_to_container(args.input, args.out, meta, force=args.force)
+            out.write("imported %s image %s as physical memory (%d segment(s))\n" % (fmt, args.input,
+                                                                                   len(writer.segments)))
+            report_written(out, writer)
+            return 0
     meta = _base_metadata(args)
     t0 = time.time()
     snapshot = None
