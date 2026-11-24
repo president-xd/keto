@@ -504,6 +504,21 @@ class ScanBoundaryTests(unittest.TestCase):
             layer.close()
             parallel._shutdown()
 
+    def test_shutdown_stops_the_workers(self):
+        """On Python 3.8, shutdown(wait=False) left the workers running and the interpreter never exited."""
+        pool = parallel._pool(2)
+        self.assertEqual(pool.submit(int, "7").result(timeout=60), 7)  # starts the workers
+        procs = list(pool._processes.values())
+        try:
+            parallel._shutdown()
+            for p in procs:
+                p.join(30)
+            self.assertEqual([p for p in procs if p.is_alive()], [])
+        finally:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+
 
 class ProfileTests(unittest.TestCase):
     def test_gpu_name_banners(self):

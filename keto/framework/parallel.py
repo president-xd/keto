@@ -14,6 +14,7 @@ import atexit
 import mmap
 import os
 import pickle
+import weakref
 from typing import Dict, List, Optional, Sequence, Tuple
 
 PARALLEL_MIN = 512 << 20   # images smaller than this are scanned in-process
@@ -21,6 +22,7 @@ PART_SIZE = 256 << 20
 _POOL = None
 _POOL_SIZE = 0
 _IN_WORKER = False
+_SUBMITTED = weakref.WeakSet()  # futures still referenced by the pool, so Python 3.8 can cancel them
 
 
 class PMatch:
@@ -72,8 +74,13 @@ def _shutdown():
     if _POOL is not None:
         try:
             _POOL.shutdown(wait=False, cancel_futures=True)
-        except TypeError:  # Python 3.8: no cancel_futures
-            _POOL.shutdown(wait=False)
+        except TypeError:
+            # Python 3.8 has no cancel_futures, and its shutdown(wait=False) closes the call queue under the pool's
+            # manager thread, which then dies before telling the workers to exit; multiprocessing waits for those
+            # workers forever at interpreter exit. Cancel what has not started and wait for the rest.
+            for f in list(_SUBMITTED):
+                f.cancel()
+            _POOL.shutdown(wait=True)
         _POOL = None
 
 
@@ -182,6 +189,7 @@ def parallel_scan(scanner, specs, total: int, part_size: int = PART_SIZE, force:
         return None
     pool = _pool(n)
     futures = [pool.submit(_scan_part, blob, *t) for t in tasks]
+    _SUBMITTED.update(futures)
 
     def gen():
         for f in futures:
