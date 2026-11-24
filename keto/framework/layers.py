@@ -59,8 +59,14 @@ class DataLayer:
         return sum(length for _, length in self.ranges())
 
     def _starts(self):
+        """``(ranges, starts)`` for bisecting. Layers return the same stored list from ranges(), so the starts are
+        built once per list (a sparse image can have hundreds of thousands of runs)."""
         rs = self.ranges()
-        return rs, [s for s, _ in rs]
+        cached = getattr(self, "_starts_cache", None)
+        if cached is None or cached[0] is not rs or len(cached[1]) != len(rs):
+            cached = (rs, [s for s, _ in rs])
+            self._starts_cache = cached
+        return cached
 
     def is_valid(self, offset: int, length: int = 1) -> bool:
         if offset < 0 or length <= 0:

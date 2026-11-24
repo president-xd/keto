@@ -93,28 +93,31 @@ def _mark_worker():
     _IN_WORKER = True
 
 
-def _scan_part(scanner_blob: bytes, path: str, fstart: int, fend: int, keep_from: int, limit: int, loff: int):
-    """Worker: scan file bytes [fstart, fend) (``fstart`` includes look-behind before the part, ``fend`` the
-    overlap after it; ``loff`` is the layer offset of ``fstart``); keep hits starting in [keep_from, limit). The
-    look-behind lets a match that began before the part be recognised as such, instead of its tail being
-    reported as a new match at the part boundary."""
+def _scan_part(scanner_blob: bytes, path: str, pieces: Sequence[Tuple[int, int, int, int, int]]):
+    """Worker: for each piece ``(fstart, fend, keep_from, limit, loff)`` scan file bytes [fstart, fend)
+    (``fstart`` includes look-behind before the piece, ``fend`` the overlap after it; ``loff`` is the layer
+    offset of ``fstart``) and keep hits starting in [keep_from, limit). The look-behind lets a match that began
+    before the piece be recognised as such, instead of its tail being reported as a new match at the boundary.
+    Pieces are scanned independently, so no match spans two regions; one task carries many small regions of the
+    same file (a sparse container has one region per run of pages)."""
     scanner = pickle.loads(scanner_blob)
     out = []
     # mapped per task and unmapped before returning, so no worker keeps the evidence file open (Windows locks it)
     with open(path, "rb") as fh:
         mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
-            if scanner.scan_region is not None and not getattr(scanner, "ignore_case", False):
-                hits = scanner.scan_region(mm, fstart, fend, loff)
-            else:  # scanners that need their own copy of the data (e.g. case-folding) get it chunk by chunk
-                hits = _chunked(scanner, mm, fstart, fend, loff)
-            for hit, value in hits:
-                if hit < keep_from or hit >= limit:
-                    continue
-                if hasattr(value, "re") and hasattr(value, "span"):  # re.Match -> picklable copy
-                    value = PMatch(value)
-                out.append((hit, value))
-            del hits
+            in_place = scanner.scan_region is not None and not getattr(scanner, "ignore_case", False)
+            for fstart, fend, keep_from, limit, loff in pieces:
+                # scanners that need their own copy of the data (e.g. case-folding) get it chunk by chunk
+                hits = scanner.scan_region(mm, fstart, fend, loff) if in_place else \
+                    _chunked(scanner, mm, fstart, fend, loff)
+                for hit, value in hits:
+                    if hit < keep_from or hit >= limit:
+                        continue
+                    if hasattr(value, "re") and hasattr(value, "span"):  # re.Match -> picklable copy
+                        value = PMatch(value)
+                    out.append((hit, value))
+                del hits
         finally:
             import gc
             gc.collect()  # drop regex iterators still exporting the mapping's buffer
@@ -139,20 +142,29 @@ def _chunked(scanner, mm, fstart, fend, loff, chunk=16 << 20):
 
 
 def plan(specs: Sequence[Tuple[int, str, int, int]], overlap: int, part_size: int = PART_SIZE
-         ) -> List[Tuple[str, int, int, int, int, int]]:
-    """Split file-backed regions ``(layer offset, path, file start, length)`` into worker tasks
-    ``(path, scan start incl. look-behind, scan end incl. overlap, keep-from layer offset, layer-offset limit,
-    layer offset of the scan start)``. Each part reads ``overlap`` bytes before and after itself (within its
-    region) but keeps only hits that start inside it, so every hit is reported exactly once."""
-    tasks = []
+         ) -> List[Tuple[str, List[Tuple[int, int, int, int, int]]]]:
+    """Split file-backed regions ``(layer offset, path, file start, length)`` into pieces ``(scan start incl.
+    look-behind, scan end incl. overlap, keep-from layer offset, layer-offset limit, layer offset of the scan
+    start)`` and group consecutive pieces of the same file into worker tasks ``(path, pieces)`` of about
+    ``part_size`` bytes. Each piece reads ``overlap`` bytes before and after itself (within its region) but keeps
+    only hits that start inside it, so every hit is reported exactly once."""
+    tasks: List[Tuple[str, List[Tuple[int, int, int, int, int]]]] = []
+    cur_path, cur, cur_bytes = None, [], 0
     for loff, path, fstart, length in specs:
         pos = 0
         while pos < length:
             n = min(part_size, length - pos)
             s = max(0, pos - overlap)
             end = min(length, pos + n + overlap)
-            tasks.append((path, fstart + s, fstart + end, loff + pos, loff + pos + n, loff + s))
+            if cur and (path != cur_path or cur_bytes + n > part_size):
+                tasks.append((cur_path, cur))
+                cur, cur_bytes = [], 0
+            cur_path = path
+            cur.append((fstart + s, fstart + end, loff + pos, loff + pos + n, loff + s))
+            cur_bytes += n
             pos += n
+    if cur:
+        tasks.append((cur_path, cur))
     return tasks
 
 

@@ -25,7 +25,7 @@ from keto.framework.renderers import RENDERERS
 from keto.framework.util import parse_size
 
 BANNER = "Keto %s - GPU memory forensics (NVIDIA)" % __version__
-SPECIAL = ("list", "acquire", "synth", "report", "sigma", "shell")
+SPECIAL = ("list", "acquire", "synth", "report", "sigma", "shell", "pdb")
 
 
 def _convert(kind):
@@ -110,6 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
     sg.add_argument("--out", required=True, help="output directory")
     sh = sub.add_parser("shell", help="interactive Python shell with the analysis context loaded")
     sh.add_argument("--command", dest="shell_command", help="run this Python statement instead of an interactive shell")
+    from keto.winmem.symcmd import add_parser as add_symbols_parser
+    add_symbols_parser(sub)
 
     def esc(text):  # argparse %-formats help strings (and validates them on Python >= 3.14)
         return str(text).replace("%", "%%")
@@ -257,6 +259,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "acquire":
             from keto.acquire.cli import run_acquire
             return run_acquire(args, out)
+        if args.command == "pdb":
+            from keto.winmem.symcmd import run as run_symbols
+            return run_symbols(args, out)
         if args.command == "sigma":
             from keto.rules import sigma
             for p in sigma.write_all(args.out):

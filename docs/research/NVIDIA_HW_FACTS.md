@@ -2565,6 +2565,180 @@ Notes:
 
 ---
 
+# Topic 7: PRAMIN window (VRAM acquisition through BAR0)
+
+Collected 2026-11-24 for `keto acquire --method pramin` (keto/acquire/pramin.py). Two extra tags are used in this
+topic only: **[nova]** = the Linux nova-core driver and its documentation (`drivers/gpu/nova-core`,
+`Documentation/gpu/nova`; its source files carry NVIDIA copyright lines), and **[Linux]** = Linux kernel PCI,
+sysfs and lockdown code or ABI documentation.
+
+| Repository | Ref | Commit | Commit date |
+|---|---|---|---|
+| github.com/NVIDIA/open-gpu-kernel-modules | main | a4b95f6a2db0bba10ccaccef79190a3c18dcf14a | 2026-11-18 |
+| github.com/torvalds/linux (nova-core, nouveau, PCI, lockdown) | master | b6a9fa34ce4187cb69d3c588a4bbffc31ce5db8f | 2026-11-22 |
+| github.com/envytools/envytools | master | f102b82381f3f11cee113d16374c87091db039d9 | 2023-10-26 |
+
+`OGKM` below abbreviates `https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/main/src`; `LNX` is
+`https://raw.githubusercontent.com/torvalds/linux/b6a9fa34ce4187cb69d3c588a4bbffc31ce5db8f`. nova-core files were
+read through the GitHub contents API at the same commit (`gh api repos/torvalds/linux/contents/<path>`).
+
+## 7.1 The aperture: BAR0 0x700000, 1 MiB
+
+The same range in every published `dev_ram.h` from Maxwell to Blackwell [NVIDIA-published],
+OGKM/common/inc/swref/published/maxwell/gm107/dev_ram.h (also `volta/gv100`, `turing/tu102`, `hopper/gh100`,
+`blackwell/gb202/dev_ram.h`):
+
+```c
+#define NV_PRAMIN                             0x007FFFFF:0x00700000 /* RW--M */
+#define NV_PRAMIN_DATA032(i)                     (0x00700000+(i)*4) /* RW-4A */
+#define NV_PRAMIN_DATA032__SIZE_1                            524288 /*       */
+```
+
+- The RM sizes its BAR0 window with `DRF_SIZE(NV_PRAMIN)` (`pKernelBus->physicalBar0WindowSize = DRF_SIZE(NV_PRAMIN);`) and accesses it at `DRF_BASE(NV_PRAMIN) + (addr & 0xffff)` after positioning the window [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c . `DATA032__SIZE_1` (524288 words = 2 MiB) disagrees with the 1 MiB range; Keto uses the range, as RM does [derived].
+- envytools: `<reg8 offset="0x700000" name="PMEM" length="0x100000" variants="G80-" />`, and the window register's doc string "the 1MB PMEM window at 0x700000. This is always unpaged and goes directly to VRAM / sysRAM" [envytools], https://raw.githubusercontent.com/envytools/envytools/master/rnndb/nv_mmio.xml , https://raw.githubusercontent.com/envytools/envytools/master/rnndb/bus/pbus.xml .
+- nova: "This 1 MiB sliding window, located at a fixed offset within BAR0", "Window starts at BAR0 + 0x700000", "Program PRAMIN to any 64 KiB-aligned VRAM boundary", `actual_vram_addr = (BASE_ADDR << 16) + pramin_offset` with a 20-bit offset; the page says it is "current as of the Ampere family" [nova], LNX/Documentation/gpu/nova/core/pramin.rst (rendered: https://docs.kernel.org/gpu/nova/core/pramin.html). nova-core: `PRAMIN: PraminWindow @ 0x700000;`, `const WINDOW_SIZE: usize = SZ_1M;`, `const BASE_ALIGN: Alignment = Alignment::new::<SZ_64K>();` [nova], `drivers/gpu/nova-core/mm/pramin.rs`.
+
+## 7.2 Window register, Kepler..Ada: NV_PBUS_BAR0_WINDOW (0x1700)
+
+[NVIDIA-published], OGKM/common/inc/swref/published/maxwell/gm107/dev_bus.h :
+
+```c
+#define NV_PBUS_BAR0_WINDOW                              0x00001700 /* RW-4R */
+#define NV_PBUS_BAR0_WINDOW_BASE                               23:0 /* RWIUF */
+#define NV_PBUS_BAR0_WINDOW_BASE_0                       0x00000000 /* RWI-V */
+#define NV_PBUS_BAR0_WINDOW_TARGET                            25:24 /* RWIUF */
+#define NV_PBUS_BAR0_WINDOW_TARGET_VID_MEM               0x00000000 /* RWI-V */
+#define NV_PBUS_BAR0_WINDOW_TARGET_SYS_MEM_COHERENT      0x00000002 /* RW--V */
+#define NV_PBUS_BAR0_WINDOW_TARGET_SYS_MEM_NONCOHERENT   0x00000003 /* RW--V */
+#define NV_PBUS_BAR0_WINDOW_BASE_SHIFT                           16 /*       */
+```
+
+The `turing/tu102`, `ampere/ga100` and `ada/ad102` `dev_bus.h` files do not define it; the RM uses this GM107
+definition for those chips:
+
+- `kbusSetBAR0WindowVidOffset_GM107` asserts `(vidOffset & 0xffff)==0` and `(vidOffset >> 16) <= DRF_MASK(NV_PBUS_BAR0_WINDOW_BASE)`, then writes `_BASE` = `vidOffset >> 16` and `_TARGET` = `_VID_MEM` with two field writes [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c .
+- HAL binding: `kbusSetBAR0WindowVidOffset_GH100` for "GH100 | GB100 | GB102 | GB10B | GB10C | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C | GR100 | GR102", `kbusSetBAR0WindowVidOffset_GM107` otherwise; the RM's chip list is TU102..TU117, GA100..GA107, AD102..AD107 and the GH100+ chips [NVIDIA-published (RM code)], OGKM/nvidia/generated/g_kern_bus_nvoc.c .
+- nova-core: `NV_PBUS_BAR0_WINDOW(u32) @ 0x00001700 { 25:24 target ?=> Bar0WindowTarget; 23:0 base; }` with `VidMem = 0`, and `mm_hal()` maps `Architecture::Turing | Architecture::Ampere | Architecture::Ada => tu102::TU102_HAL`, which writes `target = VidMem` and `base` = `base >> 16` [nova], `drivers/gpu/nova-core/mm/regs.rs`, `mm/hal.rs`, `mm/hal/tu102.rs`.
+- nouveau: `nv50_instmem_set_bar0_window_addr()` does `nvkm_wr32(device, 0x001700, addr >> 16);` and the slow accessors read/write `0x700000 + addr` with `base = (...) & 0xffffff00000ULL`, `addr = (...) & 0x000000fffffULL` [nouveau], LNX/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c . `nv50_instmem_new` is the instmem of chipsets nv50..nvaf, nvc0..nvd9, nve4..nvf1, nv106, nv108, nv117..nv126, nv130..nv138, nv140, nv162..nv168, nv170..nv177, nv192..nv197 (i.e. Kepler..Volta and Turing..Ada among Keto's chips) [nouveau], LNX/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c .
+- envytools: `PBUS` array at 0x1000, `HOST_MEM` at +0x700, register `PMEM` (= 0x1700) with `OFFSET` 23:0 `shr="16"` and `TARGET` 25:24, variants `G80:GF100` and `GF100-` [envytools], https://raw.githubusercontent.com/envytools/envytools/master/rnndb/bus/pbus.xml .
+
+## 7.3 Window register, Hopper / Blackwell / Rubin: NV_XAL_EP_BAR0_WINDOW (0x10fd40)
+
+[NVIDIA-published], OGKM/common/inc/swref/published/hopper/gh100/dev_nv_xal_ep_zb.h :
+
+```c
+#define NV_XAL_EP_ZB                               0x00000FFF:0x00000000 /* RW--D */
+#define NV_XAL_EP_ZB_BAR0_WINDOW_BASE_SHIFT                                         0x000010
+#define NV_XAL_EP_ZB_BAR0_WINDOW_BASE                                                   21:0
+#define NV_XAL_EP_ZB_BAR0_WINDOW                                                  0x00000d40
+```
+
+- `ZB` registers are offsets inside the XAL aperture. `kbusConstructXalApertures_GH100` builds it with `ioaprtInit(&(pKernelBus->xalApertures[XAL_BASE]), ..., NV_XAL_BASE_ADDRESS, DRF_SIZE(NV_XAL_EP_ZB));`, and `kbusWriteBAR0WindowBase_GH100` does `REG_FLD_WR_DRF_NUM(pXalAperture, _XAL_EP_ZB, _BAR0_WINDOW, _BASE, base);` (a field read-modify-write) [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c . `kern_bus_gh100.c` includes `published/hopper/gh100/hwproject.h`, which has `#define NV_XAL_BASE_ADDRESS 1110016` [NVIDIA-published], OGKM/common/inc/swref/published/hopper/gh100/hwproject.h . 1110016 = 0x10F000, so the register is at 0x10F000 + 0xD40 = **0x10FD40** [derived].
+- `kbusSetBAR0WindowVidOffset_GH100`: "_BAR0_WINDOW_TARGET field is removed. It's always VIDMEM" [NVIDIA-published (RM code)], same file.
+- nova-core states the absolute address: `NV_XAL_EP_BAR0_WINDOW(u32) @ 0x0010fd40 { 21:0 base; }` ("Hopper register for PRAMIN window", base bits 37:16) and, for "Blackwell GB10x/GB20x", `@ 0x0010fd40 { 22:0 base; }` (bits 38:16); `mm_hal()` maps `Architecture::Hopper => gh100::GH100_HAL` and `Architecture::BlackwellGB10x | Architecture::BlackwellGB20x => gb100::GB100_HAL` [nova], `drivers/gpu/nova-core/mm/regs.rs`, `mm/hal.rs`.
+- Blackwell: `NV_XAL_EP_ZB_BAR0_WINDOW 0x00000d40`, `NV_XAL_EP_ZB_BAR0_WINDOW_BASE 22:0`, `NV_XAL_EP_BAR0_WINDOW_BASE_SHIFT 0x000010` [NVIDIA-published], OGKM/common/inc/swref/published/blackwell/gb100/dev_nv_xal_ep_zb.h ; `blackwell/gb202/dev_nv_xal_ep_zb.h` defines only `NV_XAL_EP_ZB_BAR0_WINDOW 0x00000d40`. The RM binds `kbusWriteBAR0WindowBase_GB100` to "GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207" and `kbusConstructXalApertures_GH100` / `kbusGetXalAperture_GH100` to "GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GR100 | GR102" [NVIDIA-published (RM code)], OGKM/nvidia/generated/g_kern_bus_nvoc.c .
+- Rubin: `NV_XAL_EP_ZB_BAR0_WINDOW 0x00000D40`, `NV_XAL_EP_ZB_BAR0_WINDOW_BASE 47-17:0` (= 30:0), `..._BASE_SHIFT 16` [NVIDIA-published], OGKM/common/inc/swref/published/rubin/gr100/dev_nv_xal_ep_zb.h ; `kbusWriteBAR0WindowBase_GR100` for "GR100 | GR102" [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/bus/arch/rubin/kern_bus_gr100.c . The absolute address for Rubin (0x10FD40) is derived from the GH100 aperture construction the RM binds to GR100/GR102; nova-core does not support Rubin [derived].
+- Integrated Blackwell (GB10B, GB10C, GB20B, GB20C) uses `kbusConstructXalApertures_GB10B` and `NV_XAL_EP_ZB_BAR0_WINDOW_BASE 24:0` [NVIDIA-published], OGKM/common/inc/swref/published/blackwell/gb10b/dev_nv_xal_ep_zb.h ; Keto refuses integrated GPUs.
+
+## 7.4 Identification and the table Keto uses
+
+- BOOT_0 / BOOT_42 fields: 5.1. nova-core: "Fermi through Volta: ... boot0 is still sufficient to identify these GPUs", "Turing and later: ... Identified by first checking boot0 to ensure that the GPU is not from an earlier (pre-Fermi) era, and then using boot42", "Somewhere in the Rubin timeframe, boot0 will no longer have space to add new GPU IDs"; `is_older_than_fermi()` is `architecture_1() == 0 && architecture_0() < 0xc` with `NV_PMC_BOOT_0 { 28:24 architecture_0; 23:20 implementation; 8:8 architecture_1; ... }`, and `NV_PMC_BOOT_42(u32) @ 0x00000a00 { 29:24 architecture; 23:20 implementation; ... }` [nova], `drivers/gpu/nova-core/gpu.rs`, `gpu/regs.rs`.
+- Keto's mapping [derived from 5.4 and 7.2/7.3/7.5]: Kepler, Maxwell, Pascal, Volta, Turing, Ampere, Ada -> 0x1700 (BASE 23:0, TARGET 25:24, VID_MEM = 0); GH100 -> 0x10FD40 BASE 21:0; GB100, GB102, GB110, GB112, GB202, GB203, GB205, GB206, GB207 -> 0x10FD40 BASE 22:0; GR100, GR102 -> 0x10FD40 BASE 30:0. Chip IDs are those of the 5.4 table. Fermi, pre-Fermi, the integrated GPUs (GK20A, GM20B, GP10B, GV10B, GV11B, GA10B, GB10B, GB10C, GB20B, GB20C) and any chip not in 5.4 are refused.
+
+## 7.5 VRAM size registers
+
+Turing and GA100: [NVIDIA-published], OGKM/common/inc/swref/published/pascal/gp102/dev_fb.h :
+
+```c
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE                           0x00100CE0 /* RW-4R */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE_LOWER_SCALE                      3:0 /* RWEVF */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE_LOWER_MAG                        9:4 /* RWEVF */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE_ECC_MODE                       30:30 /* RWEVF */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE_ECC_MODE_ENABLED          0x00000001 /* RW--V */
+```
+
+`kmemsysReadUsableFbSize_GP102`: "VBIOS Devinit calculates lower range values in NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE",
+`fbSize = ((NvU64) lowerRangeMag << (lowerRangeScale + 20))`, and with ECC enabled `fbSize = fbSize / 16 * 15`
+[NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/mem_sys/arch/pascal/kern_mem_sys_gp102.c ; bound to
+"TU102 | TU104 | TU106 | TU116 | TU117 | GA100" [NVIDIA-published (RM code)],
+OGKM/nvidia/generated/g_kern_mem_sys_nvoc.c . nova-core: `NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE(u32) @ 0x00100ce0
+{ 30:30 ecc_mode_enabled; 9:4 lower_mag; 3:0 lower_scale; }`, `size / 16 * 15` with ECC, used for Turing and GA100
+[nova], `drivers/gpu/nova-core/fb/regs.rs`, `fb/hal.rs`, `fb/hal/tu102.rs`, `fb/hal/ga100.rs`.
+
+GA102 and later: [NVIDIA-published], OGKM/common/inc/swref/published/ampere/ga102/dev_gc6_island.h and
+`dev_gc6_island_addendum.h`:
+
+```c
+#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_42                                                     0x001183a4 /* RW-4R */
+#define NV_USABLE_FB_SIZE_IN_MB                                             NV_PGC6_AON_SECURE_SCRATCH_GROUP_42
+#define NV_USABLE_FB_SIZE_IN_MB_VALUE                                       31:0
+```
+
+`kmemsysReadUsableFbSize_GA102`: "VBIOS Devinit calculates the usable FB size calculated and published in
+NV_USABLE_FB_SIZE_IN_MB", `*pFbSize = ((NvU64) DRF_VAL(_USABLE, _FB_SIZE_IN_MB, _VALUE, regValue) << 20);`
+[NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/mem_sys/arch/ampere/kern_mem_sys_ga102.c ; bound to "GA102 |
+GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 | GH100 | GB100 | GB102 | GB10B | GB10C | GB110 |
+GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C | GR100 | GR102" (same `g_kern_mem_sys_nvoc.c`).
+nova-core reads `NV_USABLE_FB_SIZE_IN_MB` (`NV_PGC6_AON_SECURE_SCRATCH_GROUP_42 @ 0x001183a4`) for Ampere other than
+GA100, Ada, Hopper, GB10x and GB20x [nova], `drivers/gpu/nova-core/regs.rs`, `fb/hal.rs`, `fb/hal/ga102.rs`.
+
+- Blackwell moved `NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE` to 0x001FA3E0 with `LOWER_MAG 27:4` [NVIDIA-published], OGKM/common/inc/swref/published/blackwell/gb100/dev_fb.h ; Keto does not use it there (RM reads `NV_USABLE_FB_SIZE_IN_MB` on Blackwell).
+- No single VRAM-size register is cited for Kepler..Volta: Keto uses NVML (`memory.total` of the device at the same PCI address) or the operator's `--vram-size`, and records which [derived].
+
+## 7.6 PRI error values (reads that are not data)
+
+[NVIDIA-published], OGKM/common/inc/swref/published/maxwell/gm107/dev_pri_ringstation_sys.h :
+
+```c
+#define NV_PPRIV_SYS_PRI_ERROR_CODE                                                     31:8  /* --XVF */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_HOST_FECS_ERR                                   0xBAD00F  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_HOST_PRI_TIMEOUT                                0xBAD001  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_HOST_FB_ACK_TIMEOUT                             0xBAD0B0  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_TIMEOUT                                0xBADF10  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_DECODE                                 0xBADF11  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_RESET                                  0xBADF12  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_FLOORSWEEP                             0xBADF13  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_STUCK_ACK                              0xBADF14  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_0_EXPECTED_ACK                         0xBADF15  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_FENCE_ERROR                            0xBADF16  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_SUBID_ERROR                            0xBADF17  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_ORPHAN                                 0xBADF20  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_DEAD_RING                                  0xBADF30  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_TRAP                                       0xBADF40  /* ----V */
+#define NV_PPRIV_SYS_PRI_ERROR_CODE_FECS_PRI_CLIENT_ERR                             0xBADF50  /* ----V */
+```
+
+- RM: `#define GPU_READ_PRI_ERROR_MASK 0xFFF00000`, `#define GPU_READ_PRI_ERROR_CODE 0xBAD00000`, `#define GPU_REG_VALUE_INVALID 0xFFFFFFFF` [NVIDIA-published (RM code)], OGKM/nvidia/generated/g_gpu_nvoc.h ; "HW will return 0xbad in the upper 3 nibbles when there is a possible issue", and on a 32-bit read of `~0` the RM re-reads `NV_PMC_BOOT_0` and treats the GPU as lost if that is `GPU_REG_VALUE_INVALID` too [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/gpu_access.c .
+- envytools, "GF119 MMIO errors": `bad001XX` nonexistent register, `bad0acXX` "VM fault when accessing memory", `bad0daXX` disabled in PMC.ENABLE, `bad0fbXX` "problem accessing memory", `badf1000`..`badf1300` PRING errors (`badf1100` "no target for given address"), `badf3000`, `badf5000`; "The low 8 bits appear to be some sort of request id" [envytools], https://raw.githubusercontent.com/envytools/envytools/master/docs/hw/mmio.rst .
+- Hopper/Blackwell: `NV_XAL_EP_ZB_SCPM_PRI_DUMMY_DATA_PATTERN_INIT 0xbadf0200` [NVIDIA-published], OGKM/common/inc/swref/published/hopper/gh100/dev_nv_xal_ep_zb.h (also `blackwell/gb100`); `gpuIsValueSecFault_GH100` reports SEC_FAULT when a value and `NV_PMC_BOOT_0` both equal that pattern [NVIDIA-published (RM code)], OGKM/nvidia/src/kernel/gpu/arch/hopper/kern_gpu_gh100.c .
+- Keto's rule [derived]: a 32-bit word is a PRI error word when its bits 31:8 are one of 0xBAD00F, 0xBAD001, 0xBAD0B0, 0xBADF10..0xBADF17, 0xBADF20, 0xBADF30, 0xBADF40, 0xBADF50 (NVIDIA), 0xBAD0AC, 0xBAD0DA, 0xBAD0FB (envytools) or 0xBADF02 (SCPM pattern). A 4 KiB page is an error page only if **every** word is one; such pages are stored as read and listed. RM's broader "0xbad in the top 3 nibbles" test is used only on register reads (BOOT_0, BOOT_42, the VRAM-size registers), never to classify VRAM data, so a page of e.g. 0xBADDCAFE is data. An all-ones page is data unless BOOT_0 no longer reads its value (RM's test).
+
+## 7.7 How drivers use the window (why a bound driver is a risk)
+
+- nouveau's slow PRAMIN accessors compare the wanted base with its cached `imem->addr` and call `set_bar0_window_addr()` only `if (unlikely(imem->addr != base))`, under `imem->base.lock`; the register is never read back [nouveau], LNX/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv50.c .
+- The RM keeps `cachedBar0WindowVidOffset`, reads the register only while the cache is 0 ("RM initialises cachedBar0WindowVidOffset with 0. Refresh its value with current NV_PBUS_BAR0_WINDOW_BASE"), and writes it only "if the new offset is different from the cached value" [NVIDIA-published (RM code)], `kern_bus_gm107.c`, `kern_bus_gh100.c` (7.2, 7.3).
+- nova-core's `Pramin` keeps a "Cached window position" (`window_range`) [nova], `drivers/gpu/nova-core/mm/pramin.rs`.
+- Consequence [derived]: none of these drivers notices an external move. While Keto holds the window, a driver access through PRAMIN reaches Keto's window position (wrong VRAM: corruption on a write). When Keto finds the window moved by someone else, the value written last by that agent is what the agent's cache says the register holds, so that value, not the one saved at the start, is what Keto restores. A move and move-back between two of Keto's register checks is invisible to the register check; only a second pass can show it (as changed pages).
+
+## 7.8 Linux facts used by the preconditions
+
+- `#define PCI_VENDOR_ID_NVIDIA 0x10de`, `#define PCI_CLASS_DISPLAY_VGA 0x0300`, `#define PCI_CLASS_DISPLAY_3D 0x0302` [Linux], LNX/include/linux/pci_ids.h .
+- `#define PCI_COMMAND 0x04`, `#define PCI_COMMAND_MEMORY 0x2 /* Enable response in Memory space */`, `#define PCI_STATUS_CAP_LIST 0x10`, `#define PCI_CAPABILITY_LIST 0x34`, `#define PCI_CAP_ID_PM 0x01`, `#define PCI_PM_CTRL 4 /* PM control and status register */`, `#define PCI_PM_CTRL_STATE_MASK 0x0003 /* Current power state (D0 to D3) */` [Linux], LNX/include/uapi/linux/pci_regs.h .
+- sysfs: `resource0..N` "PCI resource N, if present (binary, mmap, rw)", `config` "PCI config space (binary, rw)", `enable` "Whether the device is enabled" [Linux], LNX/Documentation/PCI/sysfs-pci.rst ; `power_state` "can be one of: "unknown", "error", "D0", D1", "D2", "D3hot", "D3cold"" [Linux], LNX/Documentation/ABI/testing/sysfs-bus-pci . The `uevent` file carries `DRIVER=` for a bound device and `PCI_SLOT_NAME=` [Linux], LNX/drivers/base/core.c (`add_uevent_var(env, "DRIVER=%s", drv->name)`), LNX/drivers/pci/pci-driver.c .
+- `pci_mmap_resource()` first returns the error of `security_locked_down(LOCKDOWN_PCI_ACCESS)`, then `-EINVAL` if `iomem_is_exclusive(pci_resource_start(pdev, bar))` [Linux], LNX/drivers/pci/pci-sysfs.c . `resource_is_exclusive()`: "A resource is exclusive if IORESOURCE_EXCLUSIVE is set or CONFIG_IO_STRICT_DEVMEM is enabled and the resource is busy", checked only when `strict_iomem_checks` (1 with `CONFIG_STRICT_DEVMEM`); `iomem=relaxed` sets it to 0, `iomem=strict` to 1 [Linux], LNX/kernel/resource.c , LNX/Documentation/admin-guide/kernel-parameters.txt (`iomem= Disable strict checking of access to MMIO memory strict regions from userspace. relaxed`). A driver that requested BAR0 makes the region busy [derived: `pci_request_regions` semantics, not quoted here].
+- `/sys/kernel/security/lockdown` prints every level with the active one in brackets (`"[%s] "`); `lockdown_is_locked_down()` returns `-EPERM` when `kernel_locked_down >= what`; `LOCKDOWN_PCI_ACCESS` is listed before `LOCKDOWN_INTEGRITY_MAX`, so both `integrity` and `confidentiality` block it [Linux], LNX/security/lockdown/lockdown.c , LNX/include/linux/security.h .
+
+## 7.9 Not found / open questions (PRAMIN)
+
+- **Validation:** Keto's pramin method is tested against an emulator (`keto/testing/fakebar0.py`) only; no read of real hardware through it has been made.
+- **Hopper+ absolute address** is derived (RM aperture base + ZB offset) and stated by nova-core for GH100, GB10x and GB20x only; for GR100/GR102 it rests on the RM HAL binding alone.
+- **What PRAMIN returns** beyond the end of VRAM, in WPR/protected regions, under Hopper confidential-computing mode or on vGPU: not documented in the sources collected.
+- **Kepler..Volta VRAM size:** no single register found (nouveau sizes RAM per FB partition).
+- **One 32-bit load per word:** Keto reads through ctypes `c_uint32` objects; CPython's getter copies 4 bytes with a fixed-size `memcpy`, which compilers emit as one 32-bit load [derived, not verified at the instruction level].
+- **`NV_PRAMIN_DATA032__SIZE_1`** (2 MiB worth of words) contradicts the 1 MiB `NV_PRAMIN` range in the same headers.
+
+---
+
 # Implications for Keto [derived]
 
 These follow from the facts above; they are not statements from any source.
